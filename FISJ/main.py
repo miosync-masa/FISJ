@@ -674,8 +674,8 @@ class NetworkAnalyzerCore:
         base_window: int | None = None,
         scales: tuple[float, ...] | None = None,
         stride_ratio: float | None = None,
-        min_scale_support_ratio: float = 0.5,
-        min_segment_support_ratio: float = 0.25,
+        min_scale_support_ratio: float = 0.7,
+        min_segment_support_ratio: float = 0.3,
     ) -> MultiScaleNetworkResult:
         """
         Run multi-scale ensemble network analysis.
@@ -814,8 +814,8 @@ class NetworkAnalyzerCore:
         multiscale: bool = False,
         scales: tuple[float, ...] | None = None,
         stride_ratio: float | None = None,
-        min_scale_support_ratio: float = 0.5,
-        min_segment_support_ratio: float = 0.25,
+        min_scale_support_ratio: float = 0.7,
+        min_segment_support_ratio: float = 0.3,
     ) -> CooperativeEventNetwork:
         """
         Analyze a local neighborhood around an event.
