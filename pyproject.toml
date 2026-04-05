@@ -10,11 +10,12 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-  { name = "Masamichi" },
-  { name = "Tamaki" }
+  { name = "Masamichi Iizumi" },
+  { name = "Tamaki Iizumi" }
 ]
 dependencies = [
-  "numpy>=1.24"
+  "numpy>=1.24",
+  "pandas>=2.0"
 ]
 
 keywords = [
