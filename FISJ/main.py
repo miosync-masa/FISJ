@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy import stats
 
 logger = logging.getLogger("getter_one.analysis.network_analyzer_core")
 
@@ -130,6 +131,7 @@ class NetworkAnalyzerCore:
         max_lag: int = 12,
         adaptive: bool = True,
         local_std_window: int = 20,
+        p_value_threshold: float = 0.05,
     ):
         # User-provided hints (used as priors in adaptive mode)
         self.sync_threshold_hint = sync_threshold
@@ -137,6 +139,7 @@ class NetworkAnalyzerCore:
         self.max_lag_hint = max_lag
         self.adaptive = adaptive
         self.local_std_window = local_std_window
+        self.p_value_threshold = p_value_threshold
 
         # Runtime parameters (possibly overwritten adaptively)
         self.sync_threshold = sync_threshold
@@ -412,8 +415,17 @@ class NetworkAnalyzerCore:
         # 1. Compute local standard deviation internally
         local_std = self._compute_local_std(state_vectors)
 
-        # 2. Compute correlations with local-std-based normalization
-        correlations = self._compute_correlations(state_vectors, window, local_std)
+        # 2. Dual-path correlation computation
+        #    Path A: displacement partial correlation (diff/local_std)
+        #            → strong on chaotic, nonlinear, heteroscale
+        #    Path B: raw (z-scored) partial correlation
+        #            → strong on linear, autoregressive, slow dynamics
+        corr_disp = self._compute_correlations(state_vectors, window, local_std)
+
+        corr_raw = self._compute_raw_correlations(state_vectors, window)
+
+        # 3. Merge: take the stronger signal from either path
+        correlations = self._merge_dual_correlations(corr_disp, corr_raw)
 
         # 3. Build raw network structures
         sync_links, causal_links = self._build_networks(correlations, dimension_names)
@@ -616,6 +628,202 @@ class NetworkAnalyzerCore:
             "sync": sync_matrix,
             "max_lagged": max_lagged_matrix,
             "best_lag": best_lag_matrix,
+            "n_samples": len(displacement),
+            "n_dims": n_dims,
+        }
+
+    def _compute_raw_correlations(
+        self,
+        state_vectors: np.ndarray,
+        window: int,
+    ) -> dict:
+        """
+        Compute partial correlations on z-scored raw values (no differencing).
+
+        This path captures linear autoregressive dependencies that are
+        lost when displacement (diff) is applied. It complements the
+        displacement path, which excels at chaotic and nonlinear dynamics.
+
+        Parameters
+        ----------
+        state_vectors : np.ndarray
+            Input state-vector time series.
+        window : int
+            Number of frames to use.
+
+        Returns
+        -------
+        dict
+            Same structure as _compute_correlations output.
+        """
+        n_frames, n_dims = state_vectors.shape
+        w = min(window, n_frames)
+
+        sync_matrix = np.zeros((n_dims, n_dims))
+        max_lagged_matrix = np.zeros((n_dims, n_dims))
+        best_lag_matrix = np.zeros((n_dims, n_dims), dtype=int)
+
+        # Z-score normalization (no diff, just standardize per dimension)
+        raw = state_vectors[:w].copy()
+        for d in range(n_dims):
+            col = raw[:, d]
+            std = np.std(col)
+            if std > 1e-10:
+                raw[:, d] = (col - np.mean(col)) / std
+            else:
+                raw[:, d] = 0.0
+
+        logger.info("   📐 Using z-scored raw values (linear path)")
+
+        use_partial = n_dims >= 3
+
+        # Synchronous partial correlation on raw values
+        if use_partial:
+            sync_matrix = self._compute_partial_corr_precision(raw)
+        else:
+            for i in range(n_dims):
+                for j in range(i + 1, n_dims):
+                    ts_i = raw[:, i]
+                    ts_j = raw[:, j]
+                    if np.std(ts_i) < 1e-10 or np.std(ts_j) < 1e-10:
+                        continue
+                    corr = np.corrcoef(ts_i, ts_j)[0, 1]
+                    if np.isnan(corr):
+                        corr = 0.0
+                    sync_matrix[i, j] = corr
+                    sync_matrix[j, i] = corr
+
+        # Lagged partial correlation on raw values
+        for i in range(n_dims):
+            for j in range(i + 1, n_dims):
+                best_corr = 0.0
+                best_lag = 0
+
+                for lag in range(1, min(self.max_lag + 1, len(raw) - 1)):
+                    corr_ij = self._lagged_partial_corr(
+                        raw, i, j, lag, use_partial
+                    )
+                    if abs(corr_ij) > abs(best_corr):
+                        best_corr = corr_ij
+                        best_lag = lag
+
+                    corr_ji = self._lagged_partial_corr(
+                        raw, j, i, lag, use_partial
+                    )
+                    if abs(corr_ji) > abs(best_corr):
+                        best_corr = corr_ji
+                        best_lag = -lag
+
+                max_lagged_matrix[i, j] = best_corr
+                max_lagged_matrix[j, i] = best_corr
+                best_lag_matrix[i, j] = best_lag
+                best_lag_matrix[j, i] = -best_lag
+
+        return {
+            "sync": sync_matrix,
+            "max_lagged": max_lagged_matrix,
+            "best_lag": best_lag_matrix,
+            "n_samples": w,
+            "n_dims": n_dims,
+        }
+
+    @staticmethod
+    def _merge_dual_correlations(
+        corr_disp: dict,
+        corr_raw: dict,
+    ) -> dict:
+        """
+        Merge displacement and raw correlation paths.
+
+        For each dimension pair, the stronger absolute causal signal from
+        either path is selected. Crucially, the sync value is taken from
+        the SAME path that won the causal comparison. This prevents
+        cross-path interference where high raw sync blocks displacement
+        causal detection (or vice versa).
+
+        Parameters
+        ----------
+        corr_disp : dict
+            Correlation matrices from displacement path.
+        corr_raw : dict
+            Correlation matrices from raw path.
+
+        Returns
+        -------
+        dict
+            Merged correlation matrices.
+        """
+        n_dims = corr_disp["sync"].shape[0]
+
+        sync = np.zeros((n_dims, n_dims))
+        max_lagged = np.zeros((n_dims, n_dims))
+        best_lag = np.zeros((n_dims, n_dims), dtype=int)
+
+        n_disp_wins = 0
+        n_raw_wins = 0
+
+        for i in range(n_dims):
+            for j in range(i + 1, n_dims):
+                d_causal = corr_disp["max_lagged"][i, j]
+                r_causal = corr_raw["max_lagged"][i, j]
+                d_sync = corr_disp["sync"][i, j]
+                r_sync = corr_raw["sync"][i, j]
+
+                # Check which path has a valid causal signal
+                # (causal must exceed sync * 1.1 to confirm directionality)
+                d_valid = abs(d_causal) > abs(d_sync) * 1.1
+                r_valid = abs(r_causal) > abs(r_sync) * 1.1
+
+                # Safety check: raw path can only win if displacement
+                # also sees a non-trivial signal. This prevents raw from
+                # detecting spurious correlations in non-stationary data
+                # (e.g., random walks) where z-scored values have
+                # artificially high correlation due to common trends.
+                disp_confirms = abs(d_causal) > 0.1
+
+                # Selection priority:
+                #   1. Both valid + displacement confirms → stronger wins
+                #   2. Raw valid but displacement sees nothing → suspicious,
+                #      fall back to displacement
+                #   3. Only displacement valid → displacement
+                #   4. Neither valid → displacement (conservative default)
+                if d_valid and r_valid and disp_confirms:
+                    use_raw = abs(r_causal) > abs(d_causal)
+                elif r_valid and disp_confirms:
+                    use_raw = True
+                elif d_valid:
+                    use_raw = False
+                else:
+                    use_raw = False
+
+                if use_raw:
+                    max_lagged[i, j] = r_causal
+                    max_lagged[j, i] = r_causal
+                    best_lag[i, j] = corr_raw["best_lag"][i, j]
+                    best_lag[j, i] = corr_raw["best_lag"][j, i]
+                    sync[i, j] = r_sync
+                    sync[j, i] = r_sync
+                    n_raw_wins += 1
+                else:
+                    max_lagged[i, j] = d_causal
+                    max_lagged[j, i] = d_causal
+                    best_lag[i, j] = corr_disp["best_lag"][i, j]
+                    best_lag[j, i] = corr_disp["best_lag"][j, i]
+                    sync[i, j] = d_sync
+                    sync[j, i] = d_sync
+                    n_disp_wins += 1
+
+        logger.info(
+            f"   🔀 Dual-path merge: displacement won "
+            f"{n_disp_wins} pairs, raw won {n_raw_wins} pairs"
+        )
+
+        return {
+            "sync": sync,
+            "max_lagged": max_lagged,
+            "best_lag": best_lag,
+            "n_samples": min(corr_disp["n_samples"], corr_raw["n_samples"]),
+            "n_dims": corr_disp["n_dims"],
         }
 
     @staticmethod
@@ -778,9 +986,51 @@ class NetworkAnalyzerCore:
         dimension_names: list[str],
     ) -> tuple[list[DimensionLink], list[DimensionLink]]:
         """
-        Build synchronization and causal links from correlation matrices.
+        Build synchronization and causal links using p-value significance
+        testing with Benjamini-Hochberg FDR correction.
+
+        Partial correlation p-values are computed via Fisher z-transform:
+            z = atanh(r) * sqrt(n - k - 3)
+            p = 2 * (1 - Phi(|z|))
+        where n = sample size, k = number of conditioning variables.
+
+        All p-values are then corrected for multiple testing using the
+        Benjamini-Hochberg procedure, controlling the false discovery rate
+        at the level specified by p_value_threshold.
         """
         n_dims = len(dimension_names)
+        n_samples = correlations["n_samples"]
+        k_sync = max(0, n_dims - 2)
+
+        # === First pass: compute all p-values ===
+        sync_pvals = {}
+        causal_pvals = {}
+
+        for i in range(n_dims):
+            for j in range(i + 1, n_dims):
+                sync_corr = correlations["sync"][i, j]
+                causal_corr = correlations["max_lagged"][i, j]
+                lag = correlations["best_lag"][i, j]
+
+                # Sync p-value
+                sync_pvals[(i, j)] = self._pcorr_pvalue(
+                    sync_corr, n_samples, k_sync
+                )
+
+                # Causal p-value (corrected for max-over-lags selection)
+                abs_lag = abs(lag)
+                n_lagged = max(1, n_samples - abs_lag)
+                k_causal = max(0, min(n_dims - 2, n_lagged // 4))
+                p_raw = self._pcorr_pvalue(causal_corr, n_lagged, k_causal)
+                # Bonferroni correction within pair: tested max_lag × 2 directions
+                n_lag_tests = self.max_lag * 2
+                causal_pvals[(i, j)] = min(1.0, p_raw * n_lag_tests)
+
+        # === BH FDR correction ===
+        sync_pvals_corrected = self._bh_correction(sync_pvals)
+        causal_pvals_corrected = self._bh_correction(causal_pvals)
+
+        # === Second pass: build links using corrected p-values ===
         sync_links = []
         causal_links = []
 
@@ -791,7 +1041,13 @@ class NetworkAnalyzerCore:
                 lag = correlations["best_lag"][i, j]
 
                 # Synchronization link
-                if abs(sync_corr) > self.sync_threshold:
+                # Requires BOTH statistical significance (BH-corrected p-value)
+                # AND practical significance (minimum correlation strength)
+                min_sync_strength = 0.15
+                if (
+                    sync_pvals_corrected[(i, j)] < self.p_value_threshold
+                    and abs(sync_corr) > min_sync_strength
+                ):
                     sync_links.append(
                         DimensionLink(
                             from_dim=i,
@@ -805,18 +1061,20 @@ class NetworkAnalyzerCore:
                     )
 
                 # Causal link
-                # Only accept causality if lagged correlation is meaningfully
-                # stronger than synchronous correlation
+                # Requires statistical significance, practical significance,
+                # and directionality (causal > sync * 1.1)
+                # Minimum strength scales with the adaptive threshold to
+                # prevent dimensionality-induced artifacts
+                min_causal_strength = self.causal_threshold * 0.8
                 if (
-                    abs(causal_corr) > self.causal_threshold
+                    causal_pvals_corrected[(i, j)] < self.p_value_threshold
+                    and abs(causal_corr) > min_causal_strength
                     and abs(causal_corr) > abs(sync_corr) * 1.1
                 ):
-                    # Determine direction from the lag sign
                     if lag > 0:
                         from_d, to_d = i, j
                     else:
                         from_d, to_d = j, i
-                        lag = abs(lag)
 
                     causal_links.append(
                         DimensionLink(
@@ -827,24 +1085,108 @@ class NetworkAnalyzerCore:
                             link_type="causal",
                             strength=abs(causal_corr),
                             correlation=causal_corr,
-                            lag=lag,
+                            lag=abs(lag),
                         )
                     )
 
         return sync_links, causal_links
+
+    @staticmethod
+    def _pcorr_pvalue(r: float, n: int, k: int) -> float:
+        """
+        Compute p-value for a partial correlation using Fisher z-transform.
+
+        Parameters
+        ----------
+        r : float
+            Partial correlation coefficient.
+        n : int
+            Number of samples.
+        k : int
+            Number of conditioning variables.
+
+        Returns
+        -------
+        float
+            Two-sided p-value.
+        """
+        dof = n - k - 3
+        if dof < 1 or abs(r) >= 1.0:
+            return 1.0 if abs(r) < 1.0 else 0.0
+
+        z = 0.5 * np.log((1 + r) / (1 - r)) * np.sqrt(dof)
+        return float(2.0 * stats.norm.sf(abs(z)))
+
+    @staticmethod
+    def _bh_correction(
+        pvals: dict[tuple[int, int], float],
+    ) -> dict[tuple[int, int], float]:
+        """
+        Benjamini-Hochberg FDR correction for multiple testing.
+
+        Parameters
+        ----------
+        pvals : dict
+            Mapping from (i, j) pair to raw p-value.
+
+        Returns
+        -------
+        dict
+            Mapping from (i, j) pair to BH-corrected p-value.
+        """
+        if not pvals:
+            return {}
+
+        keys = list(pvals.keys())
+        raw = np.array([pvals[k] for k in keys])
+        n = len(raw)
+
+        # BH procedure
+        sorted_idx = np.argsort(raw)
+        sorted_p = raw[sorted_idx]
+        adjusted = np.zeros(n)
+
+        # Work backwards, enforcing monotonicity
+        adjusted[n - 1] = sorted_p[n - 1]
+        for i in range(n - 2, -1, -1):
+            adjusted[i] = min(
+                adjusted[i + 1],
+                sorted_p[i] * n / (i + 1),
+            )
+        adjusted = np.clip(adjusted, 0.0, 1.0)
+
+        result = {}
+        for rank, idx in enumerate(sorted_idx):
+            result[keys[idx]] = float(adjusted[rank])
+
+        return result
 
     def _filter_spurious_edges(
         self,
         causal_links: list[DimensionLink],
     ) -> list[DimensionLink]:
         """
-        Remove spurious causal edges induced by common ancestors.
+        Remove spurious causal edges using two textbook patterns.
 
-        If A -> B is detected, but there exists a common ancestor Z such that
-        both Z -> A and Z -> B exist and Z -> A is stronger than A -> B,
-        then A -> B is treated as a likely confounded edge and removed.
+        Pattern 1 — Common Ancestor:
+            If Z -> A and Z -> B both exist, then A -> B may be a
+            confounded edge induced by the shared upstream driver Z.
+            Removal requires both strength dominance and lag consistency:
+            lag(Z->A) + lag(A->B) ≈ lag(Z->B).
+
+        Pattern 2 — Mediation:
+            If A -> M and M -> B both exist with lag consistency
+            lag(A->M) + lag(M->B) ≈ lag(A->B), then A -> B is an
+            indirect (mediated) causal link and should be removed
+            in favor of the direct path through M.
+
+        Note on Colliders:
+            The collider pattern (A -> C <- B, conditioning on C
+            creates spurious A-B correlation) is already handled
+            by the precision-matrix partial correlation, which
+            conditions on all other variables simultaneously.
         """
-        if len(causal_links) < 3:
+        if len(causal_links) < 2:
             return causal_links
 
         # Fast lookup map: (from_dim, to_dim) -> strongest link
@@ -855,12 +1197,16 @@ class NetworkAnalyzerCore:
                 link_map[key] = link
 
         filtered = []
-        n_removed = 0
+        n_ancestor = 0
+        n_mediator = 0
 
         for link in causal_links:
             a, b = link.from_dim, link.to_dim
-            has_common_ancestor = False
+            lag_ab = link.lag
+            removal_reason = None
 
+            # --- Pattern 1: Common Ancestor ---
+            # Look for Z such that Z -> A and Z -> B both exist.
             for (z_src, z_dst), z_link_a in link_map.items():
                 if z_dst != a:
                     continue
@@ -872,25 +1218,77 @@ class NetworkAnalyzerCore:
                 if z_link_b is None:
                     continue
 
-                if z_link_a.strength > link.strength:
-                    has_common_ancestor = True
+                # Strength check: Z -> A must be stronger than A -> B
+                if z_link_a.strength <= link.strength:
+                    continue
+
+                # Lag consistency: lag(Z->A) + lag(A->B) ≈ lag(Z->B)
+                lag_za = z_link_a.lag
+                lag_zb = z_link_b.lag
+                expected_lag = lag_za + lag_ab
+                lag_tolerance = max(1, lag_zb // 3)
+                lag_consistent = abs(expected_lag - lag_zb) <= lag_tolerance
+
+                if lag_consistent:
+                    removal_reason = "ancestor"
                     logger.debug(
-                        f"   🔍 Spurious edge removed: "
+                        f"   🔍 Spurious (ancestor): "
                         f"{link.from_name}→{link.to_name} "
-                        f"(confounder: {z_link_a.from_name}, "
-                        f"strength {link.strength:.3f} < "
-                        f"{z_link_a.strength:.3f}, {z_link_b.strength:.3f})"
+                        f"(Z={z_link_a.from_name}, "
+                        f"lag {lag_za}+{lag_ab}≈{lag_zb}, "
+                        f"str {link.strength:.3f}<{z_link_a.strength:.3f})"
                     )
                     break
 
-            if has_common_ancestor:
-                n_removed += 1
+            # --- Pattern 2: Mediation ---
+            # Look for M such that A -> M and M -> B both exist.
+            if removal_reason is None:
+                for (src, dst) in link_map:
+                    if src != a:
+                        continue
+                    m_dim = dst
+                    if m_dim in (a, b):
+                        continue
+
+                    a_to_m = link_map[(a, m_dim)]
+                    m_to_b = link_map.get((m_dim, b))
+
+                    if m_to_b is None:
+                        continue
+
+                    # Lag consistency: lag(A->M) + lag(M->B) ≈ lag(A->B)
+                    mediated_lag = a_to_m.lag + m_to_b.lag
+                    lag_tolerance = max(2, lag_ab // 2)
+                    if abs(mediated_lag - lag_ab) > lag_tolerance:
+                        continue
+
+                    # The mediated path must be at least as strong
+                    # (weaker direct link = likely indirect)
+                    mediated_strength = min(a_to_m.strength, m_to_b.strength)
+                    if mediated_strength >= link.strength * 0.8:
+                        removal_reason = "mediator"
+                        logger.debug(
+                            f"   🔍 Spurious (mediator): "
+                            f"{link.from_name}→{link.to_name} "
+                            f"(via {a_to_m.to_name}, "
+                            f"lag {a_to_m.lag}+{m_to_b.lag}≈{lag_ab}, "
+                            f"path_str={mediated_strength:.3f} "
+                            f"vs direct={link.strength:.3f})"
+                        )
+                        break
+
+            if removal_reason == "ancestor":
+                n_ancestor += 1
+            elif removal_reason == "mediator":
+                n_mediator += 1
             else:
                 filtered.append(link)
 
-        if n_removed > 0:
+        n_total = n_ancestor + n_mediator
+        if n_total > 0:
             logger.info(
-                f"   🔍 Spurious edge filter: {n_removed} removed, "
+                f"   🔍 Spurious filter: {n_total} removed "
+                f"(ancestor={n_ancestor}, mediator={n_mediator}), "
                 f"{len(filtered)} retained"
             )
 
