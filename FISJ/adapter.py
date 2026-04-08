@@ -278,10 +278,13 @@ class FISJInverseAdapter:
         if self.binary_threshold is not None:
             adjacency = (scores > self.binary_threshold).astype(int)
         else:
-            # Use detected links from engine
-            adjacency = np.zeros((n, n), dtype=int)
-            for link in result.links:
-                adjacency[link.from_dim, link.to_dim] = 1
+            # Adaptive binarization: percentile of nonzero scores
+            nonzero = scores[scores > 0]
+            if len(nonzero) > 0:
+                thr = float(np.percentile(nonzero, 50))
+                adjacency = (scores > thr).astype(int)
+            else:
+                adjacency = np.zeros((n, n), dtype=int)
 
         np.fill_diagonal(adjacency, 0)
 
