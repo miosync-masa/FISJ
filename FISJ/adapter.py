@@ -395,7 +395,7 @@ class FISJFusionAdapter:
         # threshold tuning has no effect anyway.
         nac = NetworkAnalyzerCore(
             max_lag=self.max_lag,
-            adaptive=False,
+            adaptive=True,
             p_value_threshold=self.alpha,
         )
         nac_result = nac.analyze(
