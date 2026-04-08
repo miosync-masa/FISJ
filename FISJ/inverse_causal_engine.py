@@ -122,12 +122,12 @@ class InverseCausalEngineConfig:
     validation_fraction: float = 0.25
     min_train_size: int = 40
     min_effect: float = 1e-6
-    score_mode: str = "block_norm"  # "block_norm", "delta_mse", "mixed"
+    score_mode: str = "mixed"  # "block_norm", "delta_mse", "mixed"
     score_mix: float = 0.65
     confidence_mix: float = 0.35
     asymmetry_weight: float = 0.25
     use_backward_check: bool = True
-    refit_on_drop: bool = True
+    refit_on_drop: bool = False
     prune_by_confidence: bool = False
     confidence_quantile: float = 0.50
     apply_textbook_filter: bool = True
