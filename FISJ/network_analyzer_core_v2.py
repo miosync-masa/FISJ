@@ -6,6 +6,8 @@ from typing import Any, Optional
 
 import numpy as np
 
+from .main import NetworkAnalyzerCore, DimensionLink, NetworkResult
+
 logger = logging.getLogger("getter_one.analysis.network_analyzer_core_v2")
 
 
