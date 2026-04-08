@@ -58,6 +58,8 @@ class TargetFitSummary:
     null_mse: float
     intercept: float
     self_kernel: np.ndarray
+    self_only_mse: float = 0.0
+    source_single_mse: dict[int, float] = field(default_factory=dict)
     source_kernels: dict[int, np.ndarray] = field(default_factory=dict)
     source_delta_mse_forward: dict[int, float] = field(default_factory=dict)
     source_delta_mse_backward: dict[int, float] = field(default_factory=dict)
@@ -95,6 +97,8 @@ class InverseCausalResult:
     max_lag: int
     ar_lag: int
     # --- Direct Irreducibility (post-solver layer) ---
+    unique_necessity_matrix: np.ndarray | None = None
+    marginal_necessity_matrix: np.ndarray | None = None
     necessity_matrix: np.ndarray | None = None
     indirect_support_matrix: np.ndarray | None = None
     direct_irreducibility_matrix: np.ndarray | None = None
@@ -137,6 +141,7 @@ class InverseCausalEngineConfig:
     di_alpha_raw: float = 0.35
     di_lambda_indirect: float = 1.0
     di_lag_tau: float = 1.0
+    di_use_marginal_on_paths: bool = True
 
 
 # ============================================================================
@@ -146,18 +151,15 @@ class InverseCausalEngineConfig:
 
 class DirectIrreducibilityScorer:
     """
-    Re-score edges by *necessity* and *indirect substitutability*.
+    DI v2.2: fully adaptive, zero extra parameters.
 
-    Does NOT re-solve the inverse problem.  Takes the existing
-    score_matrix_unfiltered, lag_matrix, delta_mse_matrix and
-    target_summaries, then computes:
+    Per-target ratio r = g_self / g_null determines everything:
+      - η(r): unique/marginal blend  (weak→unique, strong→marginal)
+      - β(r): soft gate floor         (weak→preserve raw, strong→let DI act)
+      - denom: max(g_self, 0.25*g_null, ε) prevents singularity
+      - sat(x) = x/(1+x) bounds necessity to [0,1)
 
-      1) Necessity  N_ij  — how much validation error increases when
-         source i is dropped from target j's model.
-      2) Indirect support  I_ij  — strongest lag-consistent two-step
-         mediator path that could replace edge i→j.
-      3) Direct irreducibility  D_ij = N / (N + λI + ε)
-      4) Final direct score  S_dir = (α·raw_norm + (1-α)·nec_norm) · D
+    No tunable parameters beyond alpha_raw and lambda_indirect.
     """
 
     def __init__(
@@ -165,11 +167,13 @@ class DirectIrreducibilityScorer:
         alpha_raw: float = 0.35,
         lambda_indirect: float = 1.0,
         lag_tau: float = 1.0,
+        use_marginal_on_paths: bool = True,
         eps: float = 1e-12,
     ):
         self.alpha_raw = alpha_raw
         self.lambda_indirect = lambda_indirect
         self.lag_tau = lag_tau
+        self.use_marginal_on_paths = use_marginal_on_paths
         self.eps = eps
 
     def compute(
@@ -178,24 +182,65 @@ class DirectIrreducibilityScorer:
         lag_matrix: np.ndarray,
         delta_mse_matrix: np.ndarray,
         target_summaries: list,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Return (necessity, indirect_support, irreducibility, direct_score)."""
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return (unique_nec, marginal_nec, hybrid_nec, indirect, irreducibility, direct_score)."""
         raw = score_matrix_unfiltered.copy()
         lag = lag_matrix.copy()
         delta = np.maximum(delta_mse_matrix.copy(), 0.0)
         n_dims = raw.shape[0]
 
-        # 1) Necessity
-        necessity = np.zeros_like(raw)
+        unique_nec = np.zeros_like(raw)
+        marginal_nec = np.zeros_like(raw)
+        hybrid_nec = np.zeros_like(raw)
+        indirect = np.zeros_like(raw)
+        irreducibility = np.zeros_like(raw)
+        direct_score = np.zeros_like(raw)
+
+        raw_norm = self._normalize(raw)
+
+        # -------- per-target adaptive necessity --------
+        target_beta = np.zeros(n_dims)
+
         for target in range(n_dims):
             s = target_summaries[target]
-            denom = max(self.eps, s.null_mse - s.baseline_mse)
-            necessity[:, target] = delta[:, target] / denom
-        necessity = np.maximum(necessity, 0.0)
-        np.fill_diagonal(necessity, 0.0)
 
-        # 2) Indirect support
-        indirect = np.zeros_like(raw)
+            g_self = max(0.0, s.self_only_mse - s.baseline_mse)
+            g_null = max(0.0, s.null_mse - s.baseline_mse)
+
+            # stable denom (internal constant ρ=0.25)
+            denom = max(g_self, 0.25 * g_null, self.eps)
+
+            # ratio: how much cross-node sources matter for this target
+            ratio = g_self / (g_null + self.eps)
+
+            # adaptive η: weak(r≈0)→unique寄り, strong(r≈1)→marginal寄り
+            eta = float(np.clip(1.0 - ratio, 0.2, 0.9))
+
+            # adaptive β: weak→preserve raw, strong→let DI act
+            beta = float(np.clip(1.0 - 0.5 * ratio, 0.5, 0.9))
+            target_beta[target] = beta
+
+            # unique necessity + saturation
+            unique_nec[:, target] = self._sat(delta[:, target] / denom)
+
+            # marginal necessity + saturation
+            for source, mse_pair in s.source_single_mse.items():
+                gain = max(0.0, s.self_only_mse - mse_pair)
+                marginal_nec[source, target] = self._sat(gain / denom)
+
+            # hybrid blend
+            hybrid_nec[:, target] = (
+                eta * unique_nec[:, target]
+                + (1.0 - eta) * marginal_nec[:, target]
+            )
+
+        np.fill_diagonal(unique_nec, 0.0)
+        np.fill_diagonal(marginal_nec, 0.0)
+        np.fill_diagonal(hybrid_nec, 0.0)
+
+        # -------- indirect support --------
+        marg_norm = self._normalize(marginal_nec)
+
         for i in range(n_dims):
             for j in range(n_dims):
                 if i == j:
@@ -205,40 +250,62 @@ class DirectIrreducibilityScorer:
                 for m in range(n_dims):
                     if m == i or m == j:
                         continue
-                    sim, smj = raw[i, m], raw[m, j]
+                    sim = raw_norm[i, m]
+                    smj = raw_norm[m, j]
                     if sim <= 0.0 or smj <= 0.0:
                         continue
-                    path_str = min(sim, smj)
+                    path_strength = min(sim, smj)
+                    if self.use_marginal_on_paths:
+                        path_strength *= min(
+                            marg_norm[i, m] + self.eps,
+                            marg_norm[m, j] + self.eps,
+                        )
                     lag_gap = abs(lij - (lag[i, m] + lag[m, j]))
-                    support = path_str * np.exp(
-                        -lag_gap / max(self.lag_tau, self.eps)
-                    )
+                    lag_weight = np.exp(-lag_gap / max(self.lag_tau, self.eps))
+                    support = path_strength * lag_weight
                     if support > best:
                         best = support
                 indirect[i, j] = best
+
         np.fill_diagonal(indirect, 0.0)
 
-        # 3) Direct irreducibility
-        irreducibility = necessity / (
-            necessity + self.lambda_indirect * indirect + self.eps
-        )
-        irreducibility = np.clip(irreducibility, 0.0, 1.0)
-        np.fill_diagonal(irreducibility, 0.0)
+        # -------- irreducibility + final score (per-target adaptive gate) --------
+        hybrid_norm = self._normalize(hybrid_nec)
 
-        # 4) Final direct score
-        raw_norm = self._normalize(raw)
-        nec_norm = self._normalize(necessity)
-        mixed = self.alpha_raw * raw_norm + (1.0 - self.alpha_raw) * nec_norm
-        direct_score = mixed * irreducibility
+        for target in range(n_dims):
+            beta = target_beta[target]
+            for source in range(n_dims):
+                if source == target:
+                    continue
+                nstar = hybrid_nec[source, target]
+                ind = indirect[source, target]
+                d = nstar / (nstar + self.lambda_indirect * ind + self.eps)
+                d = float(np.clip(d, 0.0, 1.0))
+                irreducibility[source, target] = d
+
+                mixed = (
+                    self.alpha_raw * raw_norm[source, target]
+                    + (1.0 - self.alpha_raw) * hybrid_norm[source, target]
+                )
+                gate = beta + (1.0 - beta) * d
+                direct_score[source, target] = mixed * gate
+
+        np.fill_diagonal(irreducibility, 0.0)
         np.fill_diagonal(direct_score, 0.0)
 
-        return necessity, indirect, irreducibility, direct_score
+        return unique_nec, marginal_nec, hybrid_nec, indirect, irreducibility, direct_score
 
     @staticmethod
     def _normalize(x: np.ndarray) -> np.ndarray:
         x = np.maximum(np.asarray(x, dtype=float), 0.0)
         xmax = x.max()
         return x / xmax if xmax > 0 else np.zeros_like(x)
+
+    @staticmethod
+    def _sat(x: np.ndarray) -> np.ndarray:
+        """Saturation mapping: x/(1+x), bounds to [0,1)."""
+        x = np.maximum(np.asarray(x, dtype=float), 0.0)
+        return x / (1.0 + x)
 
 
 # ============================================================================
@@ -298,9 +365,12 @@ class InverseCausalEngine:
 
         # --- Gate: データ特性のpre-scan ---
         gate = self._compute_gate(state_vectors)
+        pipeline = self._select_pipeline(gate)
+        self._effective_solver = pipeline["solver"]
         logger.info(
             f"Gate: regime={gate.regime} mean_corr={gate.mean_corr:.3f} "
-            f"N={gate.n_dims} T={gate.n_frames} feat/sample={gate.feature_sample_ratio:.2f}"
+            f"N={gate.n_dims} T={gate.n_frames} feat/sample={gate.feature_sample_ratio:.2f} "
+            f"→ solver={pipeline['solver']} DI={pipeline['use_di']}"
         )
 
         block_norm = np.zeros((n_dims, n_dims), dtype=float)
@@ -354,6 +424,8 @@ class InverseCausalEngine:
 
         # フィルタ前のscoreを保存（AUC用連続値ランキング）
         score_unfiltered = score.copy()
+        lag_unfiltered = lag.copy()
+        delta_unfiltered = delta_mse.copy()
 
         if self.config.prune_by_confidence:
             links = self._prune_by_confidence(links)
@@ -362,7 +434,7 @@ class InverseCausalEngine:
                 n_dims=n_dims,
             )
 
-        if self.config.apply_textbook_filter:
+        if pipeline["use_textbook_filter"]:
             links = self._apply_textbook_filter(links)
             score, lag, sign, block_norm, delta_mse, confidence = self._rebuild_matrices_from_links(
                 links=links,
@@ -371,23 +443,24 @@ class InverseCausalEngine:
 
         links.sort(key=lambda x: x.strength, reverse=True)
 
-        # --- Direct Irreducibility (post-solver layer) ---
-        nec_mat = ind_mat = irr_mat = dir_mat = None
-        if self.config.compute_direct_irreducibility:
+        # --- Direct Irreducibility v2 (post-solver layer) ---
+        uniq_mat = marg_mat = nec_mat = ind_mat = irr_mat = dir_mat = None
+        if pipeline["use_di"]:
             scorer = DirectIrreducibilityScorer(
                 alpha_raw=self.config.di_alpha_raw,
                 lambda_indirect=self.config.di_lambda_indirect,
                 lag_tau=max(self.config.di_lag_tau, float(self.config.lag_tolerance)),
+                use_marginal_on_paths=self.config.di_use_marginal_on_paths,
                 eps=self.config.eps,
             )
-            nec_mat, ind_mat, irr_mat, dir_mat = scorer.compute(
+            uniq_mat, marg_mat, nec_mat, ind_mat, irr_mat, dir_mat = scorer.compute(
                 score_matrix_unfiltered=score_unfiltered,
-                lag_matrix=lag,
-                delta_mse_matrix=delta_mse,
+                lag_matrix=lag_unfiltered,
+                delta_mse_matrix=delta_unfiltered,
                 target_summaries=summaries,
             )
             logger.info(
-                f"   🎯 Direct Irreducibility: "
+                f"   🎯 Direct Irreducibility v2: "
                 f"mean_D={irr_mat.mean():.4f}, "
                 f"max_D={irr_mat.max():.4f}, "
                 f"nonzero={np.count_nonzero(dir_mat)}"
@@ -407,6 +480,8 @@ class InverseCausalEngine:
             dimension_names=dimension_names,
             max_lag=self.config.max_lag,
             ar_lag=self.config.ar_lag,
+            unique_necessity_matrix=uniq_mat,
+            marginal_necessity_matrix=marg_mat,
             necessity_matrix=nec_mat,
             indirect_support_matrix=ind_mat,
             direct_irreducibility_matrix=irr_mat,
@@ -463,6 +538,47 @@ class InverseCausalEngine:
             feature_sample_ratio=feat_ratio,
             regime=regime,
         )
+
+    def _select_pipeline(self, gate: DataGate) -> dict:
+        """
+        Auto-select solver + post-processing based on data characteristics.
+
+        Routing logic:
+          - strong regime or high max_corr → Ridge (preserves all coefficients)
+          - otherwise → Lasso (sparsity helps)
+          - DI is always computed (low cost, always beneficial or neutral)
+          - textbook filter is replaced by DI
+
+        Returns dict with keys:
+          solver: "ridge" | "lasso"
+          use_di: bool
+          use_textbook_filter: bool
+          score_output: "raw" | "direct"
+        """
+        if self.config.solver != "auto":
+            # User explicitly chose a solver — respect it
+            use_di = self.config.compute_direct_irreducibility
+            return {
+                "solver": self.config.solver,
+                "use_di": use_di,
+                "use_textbook_filter": self.config.apply_textbook_filter,
+                "score_output": "direct" if use_di else "raw",
+            }
+
+        # --- Auto routing based on gate ---
+        # DI is always on (cheap post-solver layer, always beneficial or neutral)
+        # Solver choice: Ridge for dense/strong, Lasso for sparse/weak
+        if gate.regime == "strong" or gate.max_corr > 0.6:
+            solver = "ridge"
+        else:
+            solver = "lasso"
+
+        return {
+            "solver": solver,
+            "use_di": True,
+            "use_textbook_filter": False,
+            "score_output": "direct",
+        }
 
     # ---------------------------------------------------------------------
     # Core fitting
@@ -526,6 +642,7 @@ class InverseCausalEngine:
                 baseline_mse = self._mse(y_val, X_self_val @ w_ar)
 
             null_mse = self._mse(y_val, np.full_like(y_val, np.mean(y_train)))
+            self_only_mse = self._mse(y_val, X_self_val @ w_ar)
 
         else:
             # --- Original single-stage solve ---
@@ -534,6 +651,15 @@ class InverseCausalEngine:
             baseline_mse = self._mse(y_val, yhat_val)
             null_mse = self._mse(y_val, np.full_like(y_val, np.mean(y_train)))
             self_kernel = self._extract_self_kernel(w_full, meta)
+
+            # self-only MSE
+            if meta["self_cols"]:
+                X_self_train = X_train[:, meta["self_cols"]]
+                X_self_val = X_val[:, meta["self_cols"]]
+                w_self = np.linalg.lstsq(X_self_train, y_train, rcond=None)[0]
+                self_only_mse = self._mse(y_val, X_self_val @ w_self)
+            else:
+                self_only_mse = null_mse
 
         # Optional backward model for direction asymmetry
         backward_info = None
@@ -564,11 +690,20 @@ class InverseCausalEngine:
         source_delta_mse_backward: dict[int, float] = {}
         source_asymmetry: dict[int, float] = {}
         source_confidence: dict[int, float] = {}
+        source_single_mse: dict[int, float] = {}
 
         for source in sorted(source_kernels.keys()):
             cols = meta["source_cols"][source]
             if len(cols) == 0:
                 continue
+
+            # --- self + source_i only (for marginal necessity) ---
+            pair_cols = list(meta.get("self_cols", [])) + list(cols)
+            X_pair_train = X_train[:, pair_cols]
+            X_pair_val = X_val[:, pair_cols]
+            meta_pair = self._reduce_meta(meta, pair_cols)
+            w_pair = self._solve_regularized(X_pair_train, y_train, meta_pair)
+            source_single_mse[source] = self._mse(y_val, X_pair_val @ w_pair)
 
             mse_drop_fwd = self._drop_source_and_score(
                 y_train=y_train,
@@ -611,6 +746,8 @@ class InverseCausalEngine:
             null_mse=null_mse,
             intercept=intercept,
             self_kernel=self_kernel,
+            self_only_mse=self_only_mse,
+            source_single_mse=source_single_mse,
             source_kernels=source_kernels,
             source_delta_mse_forward=source_delta_mse_forward,
             source_delta_mse_backward=source_delta_mse_backward,
@@ -703,7 +840,7 @@ class InverseCausalEngine:
             return np.zeros(0, dtype=float)
 
         # Determine solver
-        solver = self.config.solver
+        solver = getattr(self, "_effective_solver", self.config.solver)
         if solver == "auto":
             n_dims = meta.get("n_dims", 3)
             solver = "lasso" if n_dims > 5 else "ridge"
