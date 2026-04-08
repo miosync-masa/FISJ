@@ -576,7 +576,7 @@ class InverseCausalEngine:
         return {
             "solver": solver,
             "use_di": True,
-            "use_textbook_filter": False,
+            "use_textbook_filter": self.config.apply_textbook_filter,
             "score_output": "direct",
         }
 
