@@ -8,782 +8,1033 @@ import numpy as np
 
 from .main import NetworkAnalyzerCore, DimensionLink, NetworkResult
 
-logger = logging.getLogger("getter_one.analysis.inverse_causal_engine")
+logger = logging.getLogger("getter_one.analysis.network_analyzer_core_v2")
 
 
 # ============================================================================
-# Inverse Causal Engine
+# NOTE
 # ----------------------------------------------------------------------------
-# Core idea
-#   For each target dimension j, solve a single inverse problem:
-#       x_j(t) <- own past + all other dimensions' lagged histories
-#   Then interpret each source block of lag coefficients as a causal kernel.
+# This file is designed as a new version layer on top of the user's existing
+# NetworkAnalyzerCore implementation.
 #
-# CauseMe-oriented design goals
-#   - use the benchmark-provided max_lag directly
-#   - produce continuous-valued edge scores for AUC/ROC evaluation
-#   - direction emerges naturally from past -> present prediction
-#   - avoid pairwise hypothesis tests / BH-FDR as the main engine
-#   - optionally apply textbook post-filters for common-ancestor / mediation
+# Expected integration:
+#   1) Keep the original DimensionLink / NetworkResult / CooperativeEventNetwork
+#      dataclasses and NetworkAnalyzerCore class in scope.
+#   2) Add this file in the same module/package, or paste it below the original
+#      implementation.
+#   3) Instantiate NetworkAnalyzerCoreV2 instead of NetworkAnalyzerCore.
+#
+# Main goals:
+#   - fully domain-agnostic regime detection
+#   - contiguous regime segmentation (no time-order destruction)
+#   - loose candidate detection + inverse-problem refinement
+#   - CauseMe-oriented precision recovery after high-recall edge harvesting
 # ============================================================================
 
 
 # ============================================================================
-# Data classes
+# New Data Classes
 # ============================================================================
 
 
 @dataclass
-class InverseCausalLink:
-    """Directed causal link inferred from one source block."""
+class GenericRegimeConfig:
+    """Domain-agnostic regime detection configuration."""
+
+    n_regimes: int = 3
+    min_segment_length: int = 40
+    smooth_window: int = 5
+    feature_windows: tuple[int, ...] = (5, 20, 50)
+    random_state: int = 42
+    n_init: int = 8
+    max_iter: int = 100
+    zscore_features: bool = True
+    allow_single_regime_fallback: bool = True
+
+
+@dataclass
+class InverseRefinementConfig:
+    """Configuration for inverse-problem refinement of candidate causal edges."""
+
+    enabled: bool = True
+    kernel_max_lag: int = 8
+    autoregressive_lag: int = 1
+    ridge_alpha: float = 1e-2
+    smooth_alpha: float = 1e-2
+    min_delta_mse: float = 1e-4
+    min_confidence: float = 0.05
+    validation_fraction: float = 0.25
+    asymmetry_weight: float = 0.25
+    refit_after_removal: bool = True
+    benefit_percentile: float = 40.0
+
+
+@dataclass
+class RefinedEdgeEvidence:
+    """Evidence summary for one refined causal edge."""
 
     from_dim: int
     to_dim: int
-    from_name: str
-    to_name: str
-    strength: float
-    signed_peak: float
-    best_lag: int
-    block_norm: float
-    delta_mse_forward: float = 0.0
-    delta_mse_backward: float = 0.0
-    asymmetry: float = 0.0
-    confidence: float = 0.0
+    chosen_lag: int
+    kernel_norm: float
+    delta_mse_forward: float
+    delta_mse_backward: float
+    asymmetry: float
+    confidence: float
 
 
 @dataclass
-class TargetFitSummary:
-    """Fit summary for a single target node."""
+class RegimeSegment:
+    """One contiguous time segment assigned to a single regime."""
 
-    target_dim: int
-    baseline_mse: float
-    null_mse: float
-    intercept: float
-    self_kernel: np.ndarray
-    source_kernels: dict[int, np.ndarray] = field(default_factory=dict)
-    source_delta_mse_forward: dict[int, float] = field(default_factory=dict)
-    source_delta_mse_backward: dict[int, float] = field(default_factory=dict)
-    source_asymmetry: dict[int, float] = field(default_factory=dict)
-    source_confidence: dict[int, float] = field(default_factory=dict)
+    regime_id: int
+    start: int
+    end: int  # exclusive
+    n_frames: int
 
 
 @dataclass
-class InverseCausalResult:
-    """Full engine output."""
+class RegimeAwareNetworkResult:
+    """Top-level result for regime-aware + inverse-refined analysis."""
 
-    links: list[InverseCausalLink]
-    score_matrix: np.ndarray
-    lag_matrix: np.ndarray
-    sign_matrix: np.ndarray
-    confidence_matrix: np.ndarray
-    block_norm_matrix: np.ndarray
-    delta_mse_matrix: np.ndarray
-    target_summaries: list[TargetFitSummary]
-    dimension_names: list[str]
-    max_lag: int
-    ar_lag: int
-
-
-@dataclass
-class InverseCausalEngineConfig:
-    """Configuration for the inverse-problem causal engine."""
-
-    max_lag: int
-    ar_lag: int = 1
-    alpha_ridge: float = 1e-2
-    alpha_smooth: float = 1e-2
-    standardize: bool = True
-    include_intercept: bool = True
-    validation_fraction: float = 0.25
-    min_train_size: int = 40
-    min_effect: float = 1e-6
-    score_mix: float = 0.65
-    confidence_mix: float = 0.35
-    asymmetry_weight: float = 0.25
-    use_backward_check: bool = True
-    refit_on_drop: bool = True
-    prune_by_confidence: bool = False
-    confidence_quantile: float = 0.50
-    apply_textbook_filter: bool = True
-    common_ancestor_strength_ratio: float = 0.95
-    mediated_path_strength_ratio: float = 0.85
-    lag_tolerance: int = 1
-    eps: float = 1e-12
+    base_result: Any
+    final_result: Any
+    regime_labels: np.ndarray
+    regime_segments: list[RegimeSegment] = field(default_factory=list)
+    regime_results: dict[int, list[Any]] = field(default_factory=dict)
+    refined_evidence: list[RefinedEdgeEvidence] = field(default_factory=list)
+    edge_frequency: dict[tuple[int, int], float] = field(default_factory=dict)
+    edge_mean_confidence: dict[tuple[int, int], float] = field(default_factory=dict)
+    edge_mean_lag: dict[tuple[int, int], float] = field(default_factory=dict)
+    regime_transition_matrix: np.ndarray | None = None
 
 
 # ============================================================================
-# Engine
+# Generic Regime Detector
 # ============================================================================
 
 
-class InverseCausalEngine:
+class GenericRegimeDetector:
     """
-    One-shot inverse-problem causal discovery engine.
+    Fully domain-agnostic regime detector using only multivariate time-series.
 
-    Workflow
-    --------
-    1. For each target j, build a lagged design matrix using:
-         - own autoregressive lags
-         - all other dimensions from lag 1..max_lag
-    2. Solve a single regularized inverse problem for that target.
-    3. Interpret each source block as a causal kernel.
-    4. Convert each block into:
-         - strength     = block norm
-         - best_lag     = lag of maximum absolute coefficient
-         - sign         = sign at peak lag
-    5. Optionally refine with validation delta-MSE and backward-time asymmetry.
-    6. Optionally apply textbook structural filters.
-
-    Notes
-    -----
-    - This engine is fully domain-agnostic.
-    - It is designed to emit continuous scores suitable for AUC/ROC evaluation.
-    - The diagonal is always zero in the returned score matrix (self AR is modeled
-      internally but not reported as causal output).
+    Design principles:
+      - no finance-specific labels or assumptions
+      - use generic dynamical features extracted from state_vectors
+      - keep contiguous segments only (never squeeze disjoint timestamps together)
     """
 
-    def __init__(self, config: InverseCausalEngineConfig):
-        if config.max_lag < 1:
-            raise ValueError("max_lag must be >= 1")
-        if config.ar_lag < 0:
-            raise ValueError("ar_lag must be >= 0")
-        self.config = config
+    def __init__(self, config: GenericRegimeConfig | None = None):
+        self.config = config or GenericRegimeConfig()
 
-    # ---------------------------------------------------------------------
-    # Public API
-    # ---------------------------------------------------------------------
-
-    def fit(self, state_vectors: np.ndarray, dimension_names: Optional[list[str]] = None) -> InverseCausalResult:
-        """Fit the engine and return continuous causal scores."""
-        state_vectors = np.asarray(state_vectors, dtype=float)
+    def detect(self, state_vectors: np.ndarray) -> np.ndarray:
         if state_vectors.ndim != 2:
             raise ValueError("state_vectors must have shape (n_frames, n_dims)")
 
         n_frames, n_dims = state_vectors.shape
-        if n_frames <= max(self.config.max_lag, self.config.ar_lag) + 5:
-            raise ValueError("Not enough frames for the requested lag structure")
+        if n_frames < max(12, self.config.min_segment_length):
+            if self.config.allow_single_regime_fallback:
+                return np.zeros(n_frames, dtype=int)
+            raise ValueError("Not enough frames for regime detection")
 
-        if dimension_names is None:
-            dimension_names = [f"dim_{i}" for i in range(n_dims)]
+        X = self._extract_features(state_vectors)
+        if self.config.zscore_features:
+            X = self._zscore_matrix(X)
 
-        block_norm = np.zeros((n_dims, n_dims), dtype=float)
-        score = np.zeros((n_dims, n_dims), dtype=float)
-        lag = np.zeros((n_dims, n_dims), dtype=int)
-        sign = np.zeros((n_dims, n_dims), dtype=float)
-        confidence = np.zeros((n_dims, n_dims), dtype=float)
-        delta_mse = np.zeros((n_dims, n_dims), dtype=float)
-        summaries: list[TargetFitSummary] = []
+        k = int(np.clip(self.config.n_regimes, 1, max(1, n_frames // self.config.min_segment_length)))
+        if k <= 1:
+            return np.zeros(n_frames, dtype=int)
 
-        for target in range(n_dims):
-            summary = self._fit_one_target(state_vectors, target)
-            summaries.append(summary)
+        labels = self._kmeans(X, k)
+        labels = self._smooth_labels(labels, self.config.smooth_window)
+        return labels.astype(int)
 
-            for source, kernel in summary.source_kernels.items():
-                kernel = np.asarray(kernel, dtype=float)
-                if kernel.size == 0:
-                    continue
-                bn = float(np.linalg.norm(kernel))
-                peak_idx = int(np.argmax(np.abs(kernel)))
-                best_lag = peak_idx + 1
-                peak_val = float(kernel[peak_idx])
-                d_f = float(summary.source_delta_mse_forward.get(source, 0.0))
-                d_b = float(summary.source_delta_mse_backward.get(source, 0.0))
-                asym = float(summary.source_asymmetry.get(source, 0.0))
-                conf = float(summary.source_confidence.get(source, 0.0))
+    def build_segments(self, labels: np.ndarray) -> list[RegimeSegment]:
+        if len(labels) == 0:
+            return []
 
-                block_norm[source, target] = bn
-                lag[source, target] = best_lag
-                sign[source, target] = np.sign(peak_val)
-                confidence[source, target] = conf
-                delta_mse[source, target] = d_f
+        segments: list[RegimeSegment] = []
+        start = 0
+        current = int(labels[0])
 
-        score = self._compose_score_matrix(block_norm, delta_mse, confidence)
-        np.fill_diagonal(score, 0.0)
-        np.fill_diagonal(block_norm, 0.0)
-        np.fill_diagonal(confidence, 0.0)
-        np.fill_diagonal(delta_mse, 0.0)
-        np.fill_diagonal(lag, 0)
-        np.fill_diagonal(sign, 0.0)
-
-        links = self._links_from_matrices(
-            score_matrix=score,
-            lag_matrix=lag,
-            sign_matrix=sign,
-            block_norm_matrix=block_norm,
-            delta_mse_matrix=delta_mse,
-            confidence_matrix=confidence,
-            dimension_names=dimension_names,
-        )
-
-        if self.config.prune_by_confidence:
-            links = self._prune_by_confidence(links)
-            score, lag, sign, block_norm, delta_mse, confidence = self._rebuild_matrices_from_links(
-                links=links,
-                n_dims=n_dims,
-            )
-
-        if self.config.apply_textbook_filter:
-            links = self._apply_textbook_filter(links)
-            score, lag, sign, block_norm, delta_mse, confidence = self._rebuild_matrices_from_links(
-                links=links,
-                n_dims=n_dims,
-            )
-
-        links.sort(key=lambda x: x.strength, reverse=True)
-
-        return InverseCausalResult(
-            links=links,
-            score_matrix=score,
-            lag_matrix=lag,
-            sign_matrix=sign,
-            confidence_matrix=confidence,
-            block_norm_matrix=block_norm,
-            delta_mse_matrix=delta_mse,
-            target_summaries=summaries,
-            dimension_names=dimension_names,
-            max_lag=self.config.max_lag,
-            ar_lag=self.config.ar_lag,
-        )
-
-    def fit_predict(self, state_vectors: np.ndarray, dimension_names: Optional[list[str]] = None) -> np.ndarray:
-        """Convenience method returning the continuous score matrix only."""
-        return self.fit(state_vectors, dimension_names).score_matrix
-
-    def predict_adjacency(self, state_vectors: np.ndarray, dimension_names: Optional[list[str]] = None) -> np.ndarray:
-        """Alias for benchmark-style usage."""
-        return self.fit_predict(state_vectors, dimension_names)
-
-    # ---------------------------------------------------------------------
-    # Core fitting
-    # ---------------------------------------------------------------------
-
-    def _fit_one_target(self, state_vectors: np.ndarray, target: int) -> TargetFitSummary:
-        y, X_full, meta, intercept = self._build_target_problem(state_vectors, target)
-        n_samples = len(y)
-
-        if n_samples < max(self.config.min_train_size, 10):
-            raise ValueError(
-                f"Target {target}: not enough samples after lag embedding ({n_samples})"
-            )
-
-        split = int(round(n_samples * (1.0 - self.config.validation_fraction)))
-        split = int(np.clip(split, self.config.min_train_size, n_samples - 5))
-
-        y_train, y_val = y[:split], y[split:]
-        X_train, X_val = X_full[:split], X_full[split:]
-
-        # Fit full forward model
-        w_full = self._solve_regularized(X_train, y_train, meta)
-        yhat_val = X_val @ w_full
-        baseline_mse = self._mse(y_val, yhat_val)
-        null_mse = self._mse(y_val, np.full_like(y_val, np.mean(y_train)))
-
-        # Optional backward model for direction asymmetry
-        backward_info = None
-        if self.config.use_backward_check:
-            backward_series = state_vectors[::-1].copy()
-            y_b, X_b, meta_b, _ = self._build_target_problem(backward_series, target)
-            if len(y_b) >= max(self.config.min_train_size, 10):
-                split_b = int(round(len(y_b) * (1.0 - self.config.validation_fraction)))
-                split_b = int(np.clip(split_b, self.config.min_train_size, len(y_b) - 5))
-                yb_train, yb_val = y_b[:split_b], y_b[split_b:]
-                Xb_train, Xb_val = X_b[:split_b], X_b[split_b:]
-                wb_full = self._solve_regularized(Xb_train, yb_train, meta_b)
-                mse_b_full = self._mse(yb_val, Xb_val @ wb_full)
-                backward_info = {
-                    "y_train": yb_train,
-                    "y_val": yb_val,
-                    "X_train": Xb_train,
-                    "X_val": Xb_val,
-                    "meta": meta_b,
-                    "w_full": wb_full,
-                    "baseline_mse": mse_b_full,
-                }
-
-        self_kernel = self._extract_self_kernel(w_full, meta)
-        source_kernels = self._extract_source_kernels(w_full, meta)
-
-        source_delta_mse_forward: dict[int, float] = {}
-        source_delta_mse_backward: dict[int, float] = {}
-        source_asymmetry: dict[int, float] = {}
-        source_confidence: dict[int, float] = {}
-
-        for source in sorted(source_kernels.keys()):
-            cols = meta["source_cols"][source]
-            if len(cols) == 0:
-                continue
-
-            mse_drop_fwd = self._drop_source_and_score(
-                y_train=y_train,
-                y_val=y_val,
-                X_train=X_train,
-                X_val=X_val,
-                meta=meta,
-                cols_to_drop=cols,
-                w_full=w_full,
-            )
-            delta_fwd = float(mse_drop_fwd - baseline_mse)
-            source_delta_mse_forward[source] = delta_fwd
-
-            if backward_info is not None:
-                cols_b = backward_info["meta"]["source_cols"].get(source, [])
-                if cols_b:
-                    mse_drop_bwd = self._drop_source_and_score(
-                        y_train=backward_info["y_train"],
-                        y_val=backward_info["y_val"],
-                        X_train=backward_info["X_train"],
-                        X_val=backward_info["X_val"],
-                        meta=backward_info["meta"],
-                        cols_to_drop=cols_b,
-                        w_full=backward_info["w_full"],
+        for t in range(1, len(labels)):
+            if int(labels[t]) != current:
+                end = t
+                if end - start >= self.config.min_segment_length:
+                    segments.append(
+                        RegimeSegment(
+                            regime_id=current,
+                            start=start,
+                            end=end,
+                            n_frames=end - start,
+                        )
                     )
-                    delta_bwd = float(mse_drop_bwd - backward_info["baseline_mse"])
-                else:
-                    delta_bwd = 0.0
-            else:
-                delta_bwd = 0.0
+                start = t
+                current = int(labels[t])
 
-            source_delta_mse_backward[source] = delta_bwd
-            asym = max(0.0, delta_fwd - delta_bwd)
-            source_asymmetry[source] = asym
-            source_confidence[source] = max(0.0, delta_fwd) + self.config.asymmetry_weight * asym
+        end = len(labels)
+        if end - start >= self.config.min_segment_length:
+            segments.append(
+                RegimeSegment(
+                    regime_id=current,
+                    start=start,
+                    end=end,
+                    n_frames=end - start,
+                )
+            )
 
-        return TargetFitSummary(
-            target_dim=target,
-            baseline_mse=baseline_mse,
-            null_mse=null_mse,
-            intercept=intercept,
-            self_kernel=self_kernel,
-            source_kernels=source_kernels,
-            source_delta_mse_forward=source_delta_mse_forward,
-            source_delta_mse_backward=source_delta_mse_backward,
-            source_asymmetry=source_asymmetry,
-            source_confidence=source_confidence,
-        )
+        return segments
 
-    def _build_target_problem(
+    def transition_matrix(self, labels: np.ndarray) -> np.ndarray:
+        if len(labels) == 0:
+            return np.zeros((0, 0))
+        n_regimes = int(np.max(labels)) + 1
+        mat = np.zeros((n_regimes, n_regimes), dtype=float)
+        for i in range(len(labels) - 1):
+            a = int(labels[i])
+            b = int(labels[i + 1])
+            mat[a, b] += 1.0
+        row_sums = mat.sum(axis=1, keepdims=True)
+        return mat / (row_sums + 1e-12)
+
+    def _extract_features(self, state_vectors: np.ndarray) -> np.ndarray:
+        n_frames, n_dims = state_vectors.shape
+        diffs = np.diff(state_vectors, axis=0, prepend=state_vectors[[0]])
+
+        # Per-frame generic features
+        mean_abs = np.mean(np.abs(state_vectors), axis=1)
+        std_abs = np.std(state_vectors, axis=1)
+        mean_step = np.mean(np.abs(diffs), axis=1)
+        std_step = np.std(diffs, axis=1)
+        energy = np.mean(state_vectors ** 2, axis=1)
+        step_energy = np.mean(diffs ** 2, axis=1)
+        dim_coherence = self._rolling_cross_dim_coherence(state_vectors, window=20)
+        low_freq_ratio = self._rolling_low_frequency_ratio(state_vectors)
+
+        feature_list = [
+            mean_abs,
+            std_abs,
+            mean_step,
+            std_step,
+            energy,
+            step_energy,
+            dim_coherence,
+            low_freq_ratio,
+        ]
+
+        for w in self.config.feature_windows:
+            feature_list.append(self._rolling_mean(mean_step, w))
+            feature_list.append(self._rolling_std(mean_step, w))
+            feature_list.append(self._rolling_mean(energy, w))
+            feature_list.append(self._rolling_std(energy, w))
+
+        X = np.column_stack(feature_list)
+        X[~np.isfinite(X)] = 0.0
+        return X
+
+    @staticmethod
+    def _zscore_matrix(X: np.ndarray) -> np.ndarray:
+        X = X.copy()
+        mu = np.mean(X, axis=0)
+        sigma = np.std(X, axis=0)
+        sigma[sigma < 1e-12] = 1.0
+        return (X - mu) / sigma
+
+    @staticmethod
+    def _rolling_mean(x: np.ndarray, window: int) -> np.ndarray:
+        n = len(x)
+        out = np.zeros(n, dtype=float)
+        for i in range(n):
+            start = max(0, i - window + 1)
+            out[i] = np.mean(x[start : i + 1])
+        return out
+
+    @staticmethod
+    def _rolling_std(x: np.ndarray, window: int) -> np.ndarray:
+        n = len(x)
+        out = np.zeros(n, dtype=float)
+        for i in range(n):
+            start = max(0, i - window + 1)
+            out[i] = np.std(x[start : i + 1])
+        return out
+
+    def _rolling_cross_dim_coherence(self, state_vectors: np.ndarray, window: int) -> np.ndarray:
+        n_frames, n_dims = state_vectors.shape
+        if n_dims < 2:
+            return np.zeros(n_frames, dtype=float)
+
+        out = np.zeros(n_frames, dtype=float)
+        for t in range(n_frames):
+            start = max(0, t - window + 1)
+            block = state_vectors[start : t + 1]
+            if len(block) < 3:
+                continue
+            corr = np.corrcoef(block.T)
+            corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+            triu = corr[np.triu_indices(n_dims, k=1)]
+            out[t] = np.mean(np.abs(triu)) if len(triu) > 0 else 0.0
+        return out
+
+    def _rolling_low_frequency_ratio(self, state_vectors: np.ndarray) -> np.ndarray:
+        n_frames, n_dims = state_vectors.shape
+        window = max(16, min(64, n_frames // 4 if n_frames >= 20 else n_frames))
+        out = np.zeros(n_frames, dtype=float)
+        for t in range(n_frames):
+            start = max(0, t - window + 1)
+            block = state_vectors[start : t + 1]
+            if len(block) < 8:
+                continue
+            fft_mag = np.abs(np.fft.rfft(block, axis=0))
+            cutoff = max(1, fft_mag.shape[0] // 4)
+            low = np.sum(fft_mag[:cutoff])
+            total = np.sum(fft_mag) + 1e-12
+            out[t] = low / total
+        return out
+
+    def _kmeans(self, X: np.ndarray, k: int) -> np.ndarray:
+        rng = np.random.default_rng(self.config.random_state)
+        best_labels = np.zeros(len(X), dtype=int)
+        best_inertia = np.inf
+
+        for _ in range(self.config.n_init):
+            idx = rng.choice(len(X), size=k, replace=False)
+            centers = X[idx].copy()
+
+            for _ in range(self.config.max_iter):
+                d2 = self._squared_distances(X, centers)
+                labels = np.argmin(d2, axis=1)
+
+                new_centers = centers.copy()
+                for j in range(k):
+                    mask = labels == j
+                    if np.any(mask):
+                        new_centers[j] = np.mean(X[mask], axis=0)
+                    else:
+                        new_centers[j] = X[rng.integers(0, len(X))]
+
+                shift = np.linalg.norm(new_centers - centers)
+                centers = new_centers
+                if shift < 1e-8:
+                    break
+
+            inertia = np.sum(np.min(self._squared_distances(X, centers), axis=1))
+            if inertia < best_inertia:
+                best_inertia = inertia
+                best_labels = labels.copy()
+
+        return best_labels
+
+    @staticmethod
+    def _squared_distances(X: np.ndarray, centers: np.ndarray) -> np.ndarray:
+        return np.sum((X[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+
+    def _smooth_labels(self, labels: np.ndarray, window: int) -> np.ndarray:
+        if window <= 1 or len(labels) < 3:
+            return labels
+        half = window // 2
+        out = labels.copy()
+        for i in range(len(labels)):
+            start = max(0, i - half)
+            end = min(len(labels), i + half + 1)
+            vals, counts = np.unique(labels[start:end], return_counts=True)
+            out[i] = vals[np.argmax(counts)]
+        return out
+
+
+# ============================================================================
+# Inverse-Problem Causal Refiner
+# ============================================================================
+
+
+class InverseCausalRefiner:
+    """
+    Refine a high-recall candidate graph by solving a node-wise inverse problem.
+
+    Strategy:
+      1) harvest candidate edges with low-ish threshold upstream
+      2) for each target node, fit a lagged linear reconstruction model
+      3) remove one parent at a time and measure validation error increase
+      4) keep only edges that materially improve future reconstruction
+      5) optionally compare forward vs backward time for directional asymmetry
+
+    This is intentionally lightweight and domain-agnostic.
+    """
+
+    def __init__(self, config: InverseRefinementConfig | None = None):
+        self.config = config or InverseRefinementConfig()
+
+    def refine(
+        self,
+        state_vectors: np.ndarray,
+        candidate_links: list[Any],
+        dimension_names: list[str],
+    ) -> tuple[list[Any], list[RefinedEdgeEvidence]]:
+        if not self.config.enabled or len(candidate_links) == 0:
+            return candidate_links, []
+
+        n_frames, n_dims = state_vectors.shape
+        by_target: dict[int, list[Any]] = {}
+        for link in candidate_links:
+            by_target.setdefault(link.to_dim, []).append(link)
+
+        kept_links: list[Any] = []
+        evidence_list: list[RefinedEdgeEvidence] = []
+
+        for target, incoming in by_target.items():
+            try:
+                target_kept, target_evidence = self._refine_one_target(
+                    state_vectors=state_vectors,
+                    target=target,
+                    incoming_links=incoming,
+                    dimension_names=dimension_names,
+                )
+                kept_links.extend(target_kept)
+                evidence_list.extend(target_evidence)
+            except Exception as exc:  # pragma: no cover - safe fallback path
+                logger.warning(
+                    "Inverse refinement failed for target %s: %s. Falling back to original links.",
+                    target,
+                    exc,
+                )
+                kept_links.extend(incoming)
+
+        return kept_links, evidence_list
+
+    def _refine_one_target(
         self,
         state_vectors: np.ndarray,
         target: int,
-    ) -> tuple[np.ndarray, np.ndarray, dict, float]:
-        """Build y, X and metadata for one target node."""
-        n_frames, n_dims = state_vectors.shape
-        max_back = max(self.config.max_lag, self.config.ar_lag)
+        incoming_links: list[Any],
+        dimension_names: list[str],
+    ) -> tuple[list[Any], list[RefinedEdgeEvidence]]:
+        max_lag = self.config.kernel_max_lag
+        ar_lag = self.config.autoregressive_lag
 
-        if self.config.standardize:
-            state_vectors = self._zscore_matrix(state_vectors)
+        parents = sorted({link.from_dim for link in incoming_links})
+        if len(parents) == 0:
+            return [], []
 
-        rows: list[list[float]] = []
-        y: list[float] = []
+        y, X, groups, group_lags = self._build_design_matrix(
+            state_vectors=state_vectors,
+            target=target,
+            parents=parents,
+            kernel_max_lag=max_lag,
+            autoregressive_lag=ar_lag,
+        )
+        if len(y) < 20 or X.shape[1] == 0:
+            return incoming_links, []
 
-        source_cols: dict[int, list[int]] = {}
-        source_lags: dict[int, list[int]] = {}
-        self_cols: list[int] = []
+        split = int(len(y) * (1.0 - self.config.validation_fraction))
+        split = int(np.clip(split, 8, len(y) - 4))
+        y_tr, y_va = y[:split], y[split:]
+        X_tr, X_va = X[:split], X[split:]
 
-        col_cursor = 0
-        if self.config.ar_lag > 0:
-            self_cols = list(range(col_cursor, col_cursor + self.config.ar_lag))
-            col_cursor += self.config.ar_lag
+        w_full = self._fit_penalized(X_tr, y_tr, groups)
+        pred_full = X_va @ w_full
+        mse_full = self._mse(y_va, pred_full)
 
-        for source in range(n_dims):
-            if source == target:
+        backward_state = state_vectors[::-1].copy()
+        y_b, X_b, groups_b, _ = self._build_design_matrix(
+            state_vectors=backward_state,
+            target=target,
+            parents=parents,
+            kernel_max_lag=max_lag,
+            autoregressive_lag=ar_lag,
+        )
+        use_backward = len(y_b) >= 20 and X_b.shape[1] > 0
+        if use_backward:
+            split_b = int(len(y_b) * (1.0 - self.config.validation_fraction))
+            split_b = int(np.clip(split_b, 8, len(y_b) - 4))
+            yb_tr, yb_va = y_b[:split_b], y_b[split_b:]
+            Xb_tr, Xb_va = X_b[:split_b], X_b[split_b:]
+            w_full_b = self._fit_penalized(Xb_tr, yb_tr, groups_b)
+            mse_full_b = self._mse(yb_va, Xb_va @ w_full_b)
+        else:
+            mse_full_b = mse_full
+            w_full_b = None
+
+        evidence: list[RefinedEdgeEvidence] = []
+        retained_edges: list[Any] = []
+        delta_values: list[float] = []
+
+        parent_to_cols = self._group_to_parent_columns(groups)
+        parent_to_cols_b = self._group_to_parent_columns(groups_b) if use_backward else {}
+
+        parent_kernel_norm: dict[int, float] = {}
+        parent_best_lag: dict[int, int] = {}
+        for p in parents:
+            cols = parent_to_cols.get(p, [])
+            if not cols:
+                parent_kernel_norm[p] = 0.0
+                parent_best_lag[p] = 1
                 continue
-            source_cols[source] = list(range(col_cursor, col_cursor + self.config.max_lag))
-            source_lags[source] = list(range(1, self.config.max_lag + 1))
-            col_cursor += self.config.max_lag
+            kernel = w_full[cols]
+            parent_kernel_norm[p] = float(np.linalg.norm(kernel))
+            best_idx = int(np.argmax(np.abs(kernel)))
+            parent_best_lag[p] = int(group_lags[p][best_idx])
 
-        for t in range(max_back, n_frames):
-            row: list[float] = []
+        for p in parents:
+            cols = parent_to_cols.get(p, [])
+            if not cols:
+                continue
 
-            # Self autoregression
-            for l in range(1, self.config.ar_lag + 1):
-                row.append(float(state_vectors[t - l, target]))
+            if self.config.refit_after_removal:
+                keep_cols = [c for c in range(X_tr.shape[1]) if c not in cols]
+                X_tr_r = X_tr[:, keep_cols]
+                X_va_r = X_va[:, keep_cols]
+                groups_r = self._remap_groups_after_column_drop(groups, keep_cols)
+                if X_tr_r.shape[1] == 0:
+                    mse_removed = np.var(y_va)
+                else:
+                    w_removed = self._fit_penalized(X_tr_r, y_tr, groups_r)
+                    mse_removed = self._mse(y_va, X_va_r @ w_removed)
+            else:
+                w_masked = w_full.copy()
+                w_masked[cols] = 0.0
+                mse_removed = self._mse(y_va, X_va @ w_masked)
 
-            # All other sources over the allowed lag window
-            for source in range(n_dims):
-                if source == target:
-                    continue
-                for l in range(1, self.config.max_lag + 1):
-                    row.append(float(state_vectors[t - l, source]))
+            delta_forward = float(mse_removed - mse_full)
+            delta_values.append(delta_forward)
 
+            if use_backward:
+                cols_b = parent_to_cols_b.get(p, [])
+                if cols_b:
+                    if self.config.refit_after_removal:
+                        keep_cols_b = [c for c in range(Xb_tr.shape[1]) if c not in cols_b]
+                        Xb_tr_r = Xb_tr[:, keep_cols_b]
+                        Xb_va_r = Xb_va[:, keep_cols_b]
+                        groups_b_r = self._remap_groups_after_column_drop(groups_b, keep_cols_b)
+                        if Xb_tr_r.shape[1] == 0:
+                            mse_removed_b = np.var(yb_va)
+                        else:
+                            wb_removed = self._fit_penalized(Xb_tr_r, yb_tr, groups_b_r)
+                            mse_removed_b = self._mse(yb_va, Xb_va_r @ wb_removed)
+                    else:
+                        wb_masked = w_full_b.copy()
+                        wb_masked[cols_b] = 0.0
+                        mse_removed_b = self._mse(yb_va, Xb_va @ wb_masked)
+                    delta_backward = float(mse_removed_b - mse_full_b)
+                else:
+                    delta_backward = 0.0
+            else:
+                delta_backward = 0.0
+
+            asymmetry = max(0.0, delta_forward - delta_backward)
+            confidence = max(0.0, delta_forward) + self.config.asymmetry_weight * asymmetry
+
+            evidence.append(
+                RefinedEdgeEvidence(
+                    from_dim=p,
+                    to_dim=target,
+                    chosen_lag=parent_best_lag[p],
+                    kernel_norm=parent_kernel_norm[p],
+                    delta_mse_forward=delta_forward,
+                    delta_mse_backward=delta_backward,
+                    asymmetry=asymmetry,
+                    confidence=confidence,
+                )
+            )
+
+        if not evidence:
+            return incoming_links, []
+
+        confidence_values = np.array([ev.confidence for ev in evidence], dtype=float)
+        cutoff = np.percentile(confidence_values, self.config.benefit_percentile)
+        cutoff = max(cutoff, self.config.min_confidence)
+
+        original_by_parent = {link.from_dim: link for link in incoming_links}
+        for ev in evidence:
+            if ev.delta_mse_forward < self.config.min_delta_mse:
+                continue
+            if ev.confidence < cutoff:
+                continue
+
+            base_link = original_by_parent[ev.from_dim]
+            new_link = type(base_link)(
+                from_dim=base_link.from_dim,
+                to_dim=base_link.to_dim,
+                from_name=base_link.from_name,
+                to_name=base_link.to_name,
+                link_type=base_link.link_type,
+                strength=max(base_link.strength, ev.confidence),
+                correlation=base_link.correlation,
+                lag=ev.chosen_lag,
+            )
+            retained_edges.append(new_link)
+
+        return retained_edges, evidence
+
+    def _build_design_matrix(
+        self,
+        state_vectors: np.ndarray,
+        target: int,
+        parents: list[int],
+        kernel_max_lag: int,
+        autoregressive_lag: int,
+    ) -> tuple[np.ndarray, np.ndarray, dict[int, list[int]], dict[int, list[int]]]:
+        n_frames, n_dims = state_vectors.shape
+        max_lag = max(kernel_max_lag, autoregressive_lag)
+        if n_frames <= max_lag + 2:
+            return np.zeros(0), np.zeros((0, 0)), {}, {}
+
+        rows = []
+        y = []
+        groups: dict[int, list[int]] = {}
+        group_lags: dict[int, list[int]] = {}
+
+        # Column layout: first optional target AR block, then one kernel block per parent.
+        col = 0
+        if autoregressive_lag > 0:
+            groups[-1] = list(range(col, col + autoregressive_lag))
+            group_lags[-1] = list(range(1, autoregressive_lag + 1))
+            col += autoregressive_lag
+        for p in parents:
+            groups[p] = list(range(col, col + kernel_max_lag))
+            group_lags[p] = list(range(1, kernel_max_lag + 1))
+            col += kernel_max_lag
+
+        for t in range(max_lag, n_frames):
+            row = []
+            if autoregressive_lag > 0:
+                for lag in range(1, autoregressive_lag + 1):
+                    row.append(state_vectors[t - lag, target])
+            for p in parents:
+                for lag in range(1, kernel_max_lag + 1):
+                    row.append(state_vectors[t - lag, p])
             rows.append(row)
-            y.append(float(state_vectors[t, target]))
+            y.append(state_vectors[t, target])
 
         X = np.asarray(rows, dtype=float)
-        y = np.asarray(y, dtype=float)
+        y_arr = np.asarray(y, dtype=float)
 
-        intercept = 0.0
-        if self.config.include_intercept:
-            intercept = float(np.mean(y))
-            y = y - intercept
+        X = self._zscore_design(X)
+        y_arr = self._zscore_vector(y_arr)
+        return y_arr, X, groups, group_lags
 
-        meta = {
-            "target": target,
-            "n_dims": n_dims,
-            "self_cols": self_cols,
-            "source_cols": source_cols,
-            "source_lags": source_lags,
-            "n_features": X.shape[1],
-        }
-        return y, X, meta, intercept
-
-    def _solve_regularized(self, X: np.ndarray, y: np.ndarray, meta: dict) -> np.ndarray:
-        """
-        Solve
-            argmin ||y - Xw||^2 + alpha_ridge ||w||^2 + alpha_smooth * lag_smoothness
-
-        lag_smoothness is applied independently to each block (self block and each source block)
-        using a discrete first-difference penalty.
-        """
+    def _fit_penalized(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        groups: dict[int, list[int]],
+    ) -> np.ndarray:
         p = X.shape[1]
         if p == 0:
-            return np.zeros(0, dtype=float)
+            return np.zeros(0)
 
         xtx = X.T @ X
         xty = X.T @ y
-        reg = self.config.alpha_ridge * np.eye(p, dtype=float)
 
-        def add_smooth_block(cols: list[int]) -> None:
-            if len(cols) < 2 or self.config.alpha_smooth <= 0:
-                return
-            lam = self.config.alpha_smooth
+        reg = self.config.ridge_alpha * np.eye(p)
+
+        # Smoothness penalty across lags inside each parent kernel.
+        for gid, cols in groups.items():
+            if gid == -1:
+                continue
+            if len(cols) < 2:
+                continue
             for a, b in zip(cols[:-1], cols[1:]):
-                reg[a, a] += lam
-                reg[b, b] += lam
-                reg[a, b] -= lam
-                reg[b, a] -= lam
-
-        add_smooth_block(meta["self_cols"])
-        for source, cols in meta["source_cols"].items():
-            add_smooth_block(cols)
+                reg[a, a] += self.config.smooth_alpha
+                reg[b, b] += self.config.smooth_alpha
+                reg[a, b] -= self.config.smooth_alpha
+                reg[b, a] -= self.config.smooth_alpha
 
         try:
             w = np.linalg.solve(xtx + reg, xty)
         except np.linalg.LinAlgError:
             w = np.linalg.pinv(xtx + reg) @ xty
-        return np.asarray(w, dtype=float)
-
-    def _drop_source_and_score(
-        self,
-        y_train: np.ndarray,
-        y_val: np.ndarray,
-        X_train: np.ndarray,
-        X_val: np.ndarray,
-        meta: dict,
-        cols_to_drop: list[int],
-        w_full: np.ndarray,
-    ) -> float:
-        """Measure validation MSE after removing one source block."""
-        if len(cols_to_drop) == 0:
-            return self._mse(y_val, X_val @ w_full)
-
-        if self.config.refit_on_drop:
-            keep_cols = [c for c in range(X_train.shape[1]) if c not in set(cols_to_drop)]
-            if len(keep_cols) == 0:
-                return self._mse(y_val, np.zeros_like(y_val))
-
-            Xtr = X_train[:, keep_cols]
-            Xva = X_val[:, keep_cols]
-            meta_reduced = self._reduce_meta(meta, keep_cols)
-            w_red = self._solve_regularized(Xtr, y_train, meta_reduced)
-            return self._mse(y_val, Xva @ w_red)
-
-        w_masked = w_full.copy()
-        w_masked[cols_to_drop] = 0.0
-        return self._mse(y_val, X_val @ w_masked)
-
-    # ---------------------------------------------------------------------
-    # Score composition
-    # ---------------------------------------------------------------------
-
-    def _compose_score_matrix(
-        self,
-        block_norm: np.ndarray,
-        delta_mse: np.ndarray,
-        confidence: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Build the final continuous score matrix.
-
-        Default behavior:
-          score = score_mix * normalized(block_norm)
-                + (1-score_mix) * normalized(positive delta_mse)
-        with optional confidence contribution blended inside delta component.
-        """
-        bn = self._normalize_positive(block_norm)
-        dm = self._normalize_positive(np.maximum(delta_mse, 0.0))
-        cf = self._normalize_positive(np.maximum(confidence, 0.0))
-
-        delta_part = (1.0 - self.config.confidence_mix) * dm + self.config.confidence_mix * cf
-        score = self.config.score_mix * bn + (1.0 - self.config.score_mix) * delta_part
-        return np.asarray(score, dtype=float)
-
-    # ---------------------------------------------------------------------
-    # Link extraction / pruning / textbook filters
-    # ---------------------------------------------------------------------
-
-    def _links_from_matrices(
-        self,
-        score_matrix: np.ndarray,
-        lag_matrix: np.ndarray,
-        sign_matrix: np.ndarray,
-        block_norm_matrix: np.ndarray,
-        delta_mse_matrix: np.ndarray,
-        confidence_matrix: np.ndarray,
-        dimension_names: list[str],
-    ) -> list[InverseCausalLink]:
-        n_dims = score_matrix.shape[0]
-        links: list[InverseCausalLink] = []
-        for source in range(n_dims):
-            for target in range(n_dims):
-                if source == target:
-                    continue
-                strength = float(score_matrix[source, target])
-                if strength <= self.config.min_effect:
-                    continue
-                links.append(
-                    InverseCausalLink(
-                        from_dim=source,
-                        to_dim=target,
-                        from_name=dimension_names[source],
-                        to_name=dimension_names[target],
-                        strength=strength,
-                        signed_peak=float(sign_matrix[source, target]),
-                        best_lag=int(lag_matrix[source, target]),
-                        block_norm=float(block_norm_matrix[source, target]),
-                        delta_mse_forward=float(delta_mse_matrix[source, target]),
-                        delta_mse_backward=0.0,  # reconstructed later if needed
-                        asymmetry=0.0,
-                        confidence=float(confidence_matrix[source, target]),
-                    )
-                )
-        return links
-
-    def _prune_by_confidence(self, links: list[InverseCausalLink]) -> list[InverseCausalLink]:
-        if not links:
-            return links
-        confs = np.array([max(0.0, link.confidence) for link in links], dtype=float)
-        cutoff = float(np.quantile(confs, self.config.confidence_quantile))
-        cutoff = max(cutoff, self.config.min_effect)
-        return [link for link in links if link.confidence >= cutoff]
-
-    def _apply_textbook_filter(self, links: list[InverseCausalLink]) -> list[InverseCausalLink]:
-        """
-        Remove likely indirect links using two classic patterns.
-
-        Pattern 1: Common ancestor
-            z->a and z->b exist, and a->b is weaker with lag consistency.
-
-        Pattern 2: Mediation
-            a->m and m->b exist, and their lag sum approximately matches a->b.
-
-        This filter is intentionally conservative and only removes weaker links.
-        """
-        if len(links) < 3:
-            return links
-
-        link_map: dict[tuple[int, int], InverseCausalLink] = {}
-        for link in links:
-            key = (link.from_dim, link.to_dim)
-            if key not in link_map or link.strength > link_map[key].strength:
-                link_map[key] = link
-
-        retained: list[InverseCausalLink] = []
-
-        for link in links:
-            a, b = link.from_dim, link.to_dim
-            remove = False
-
-            # Common ancestor: z->a and z->b both stronger than a->b
-            for (z, x), z_to_a in link_map.items():
-                if x != a or z in (a, b):
-                    continue
-                z_to_b = link_map.get((z, b))
-                if z_to_b is None:
-                    continue
-
-                stronger = (
-                    z_to_a.strength >= link.strength * self.config.common_ancestor_strength_ratio
-                    and z_to_b.strength >= link.strength * self.config.common_ancestor_strength_ratio
-                )
-                lag_consistent = abs((z_to_a.best_lag + link.best_lag) - z_to_b.best_lag) <= self.config.lag_tolerance
-
-                if stronger and lag_consistent:
-                    remove = True
-                    break
-
-            # Mediation: a->m and m->b explain a->b
-            if not remove:
-                for (src, m), a_to_m in link_map.items():
-                    if src != a or m in (a, b):
-                        continue
-                    m_to_b = link_map.get((m, b))
-                    if m_to_b is None:
-                        continue
-
-                    path_strength = min(a_to_m.strength, m_to_b.strength)
-                    strength_ok = path_strength >= link.strength * self.config.mediated_path_strength_ratio
-                    lag_ok = abs((a_to_m.best_lag + m_to_b.best_lag) - link.best_lag) <= self.config.lag_tolerance
-
-                    if strength_ok and lag_ok:
-                        remove = True
-                        break
-
-            if not remove:
-                retained.append(link)
-
-        return retained
-
-    def _rebuild_matrices_from_links(
-        self,
-        links: list[InverseCausalLink],
-        n_dims: int,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        score = np.zeros((n_dims, n_dims), dtype=float)
-        lag = np.zeros((n_dims, n_dims), dtype=int)
-        sign = np.zeros((n_dims, n_dims), dtype=float)
-        block_norm = np.zeros((n_dims, n_dims), dtype=float)
-        delta_mse = np.zeros((n_dims, n_dims), dtype=float)
-        confidence = np.zeros((n_dims, n_dims), dtype=float)
-
-        for link in links:
-            i, j = link.from_dim, link.to_dim
-            score[i, j] = link.strength
-            lag[i, j] = link.best_lag
-            sign[i, j] = link.signed_peak
-            block_norm[i, j] = link.block_norm
-            delta_mse[i, j] = link.delta_mse_forward
-            confidence[i, j] = link.confidence
-
-        return score, lag, sign, block_norm, delta_mse, confidence
-
-    # ---------------------------------------------------------------------
-    # Kernel extraction helpers
-    # ---------------------------------------------------------------------
+        return w
 
     @staticmethod
-    def _extract_self_kernel(w: np.ndarray, meta: dict) -> np.ndarray:
-        cols = meta["self_cols"]
-        if not cols:
-            return np.zeros(0, dtype=float)
-        return np.asarray(w[cols], dtype=float)
+    def _group_to_parent_columns(groups: dict[int, list[int]]) -> dict[int, list[int]]:
+        return {gid: cols for gid, cols in groups.items() if gid != -1}
 
     @staticmethod
-    def _extract_source_kernels(w: np.ndarray, meta: dict) -> dict[int, np.ndarray]:
-        out: dict[int, np.ndarray] = {}
-        for source, cols in meta["source_cols"].items():
-            out[source] = np.asarray(w[cols], dtype=float)
-        return out
-
-    @staticmethod
-    def _reduce_meta(meta: dict, keep_cols: list[int]) -> dict:
+    def _remap_groups_after_column_drop(
+        groups: dict[int, list[int]],
+        keep_cols: list[int],
+    ) -> dict[int, list[int]]:
         mapping = {old: new for new, old in enumerate(keep_cols)}
-        self_cols = [mapping[c] for c in meta["self_cols"] if c in mapping]
-        source_cols = {}
-        for source, cols in meta["source_cols"].items():
+        out: dict[int, list[int]] = {}
+        for gid, cols in groups.items():
             new_cols = [mapping[c] for c in cols if c in mapping]
             if new_cols:
-                source_cols[source] = new_cols
-        return {
-            "target": meta["target"],
-            "n_dims": meta["n_dims"],
-            "self_cols": self_cols,
-            "source_cols": source_cols,
-            "source_lags": meta["source_lags"],
-            "n_features": len(keep_cols),
-        }
-
-    # ---------------------------------------------------------------------
-    # Numerical helpers
-    # ---------------------------------------------------------------------
+                out[gid] = new_cols
+        return out
 
     @staticmethod
     def _mse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
         if len(y_true) == 0:
             return 0.0
-        diff = y_true - y_pred
-        return float(np.mean(diff * diff))
+        return float(np.mean((y_true - y_pred) ** 2))
 
     @staticmethod
-    def _normalize_positive(x: np.ndarray) -> np.ndarray:
-        x = np.asarray(x, dtype=float)
-        x = np.maximum(x, 0.0)
-        xmax = float(np.max(x)) if x.size > 0 else 0.0
-        if xmax <= 0:
-            return np.zeros_like(x)
-        return x / xmax
+    def _zscore_design(X: np.ndarray) -> np.ndarray:
+        X = X.copy()
+        mu = np.mean(X, axis=0)
+        sigma = np.std(X, axis=0)
+        sigma[sigma < 1e-12] = 1.0
+        return (X - mu) / sigma
 
     @staticmethod
-    def _zscore_matrix(x: np.ndarray) -> np.ndarray:
-        mu = np.mean(x, axis=0, keepdims=True)
-        sd = np.std(x, axis=0, keepdims=True)
-        sd[sd < 1e-12] = 1.0
-        return (x - mu) / sd
+    def _zscore_vector(x: np.ndarray) -> np.ndarray:
+        mu = np.mean(x)
+        sigma = np.std(x)
+        if sigma < 1e-12:
+            sigma = 1.0
+        return (x - mu) / sigma
 
 
 # ============================================================================
-# Benchmark-friendly convenience function
+# Aggregation Helpers
 # ============================================================================
 
 
-def predict_adjacency(data: np.ndarray, max_lag: int) -> np.ndarray:
-    """
-    CauseMe-style convenience entrypoint.
+class _AggregatedLink:
+    """Internal helper used before converting back to user-level DimensionLink."""
 
-    Parameters
-    ----------
-    data : np.ndarray, shape (T, N)
-        Multivariate time-series.
-    max_lag : int
-        Benchmark-provided maximum lag.
+    __slots__ = ("from_dim", "to_dim", "strengths", "correlations", "lags")
 
-    Returns
-    -------
-    np.ndarray, shape (N, N)
-        Continuous adjacency score matrix. Entry [i, j] represents i -> j.
+    def __init__(self, from_dim: int, to_dim: int):
+        self.from_dim = from_dim
+        self.to_dim = to_dim
+        self.strengths: list[float] = []
+        self.correlations: list[float] = []
+        self.lags: list[int] = []
+
+    def add(self, strength: float, correlation: float, lag: int = 0) -> None:
+        self.strengths.append(float(strength))
+        self.correlations.append(float(correlation))
+        self.lags.append(int(lag))
+
+
+# ============================================================================
+# New Version: Regime-aware + Inverse-refined analyzer
+# ============================================================================
+
+
+class NetworkAnalyzerCoreV2(NetworkAnalyzerCore):
     """
-    engine = InverseCausalEngine(
-        InverseCausalEngineConfig(
-            max_lag=max_lag,
-            ar_lag=1,
-            alpha_ridge=1e-2,
-            alpha_smooth=1e-2,
-            standardize=True,
-            include_intercept=True,
-            validation_fraction=0.25,
-            min_train_size=max(20, 2 * max_lag),
-            score_mix=0.70,
-            confidence_mix=0.35,
-            asymmetry_weight=0.25,
-            use_backward_check=True,
-            refit_on_drop=False,
-            prune_by_confidence=False,
-            apply_textbook_filter=True,
+    New version targeting noisy, non-stationary benchmark settings such as CauseMe.
+
+    Pipeline
+    --------
+    1. Run the original analyzer on the full sequence with intentionally high recall.
+    2. Detect generic regimes and extract contiguous segments.
+    3. Run the original analyzer on each sufficiently long segment.
+    4. Aggregate causal evidence across segments.
+    5. Refine the candidate causal graph with a node-wise inverse problem.
+    """
+
+    def __init__(
+        self,
+        *args,
+        regime_config: GenericRegimeConfig | None = None,
+        inverse_config: InverseRefinementConfig | None = None,
+        candidate_threshold_scale: float = 0.75,
+        min_segment_causal_frequency: float = 0.20,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.regime_detector = GenericRegimeDetector(regime_config)
+        self.inverse_refiner = InverseCausalRefiner(inverse_config)
+        self.candidate_threshold_scale = candidate_threshold_scale
+        self.min_segment_causal_frequency = min_segment_causal_frequency
+
+    def analyze_regime_aware(
+        self,
+        state_vectors: np.ndarray,
+        dimension_names: list[str] | None = None,
+        window: int | None = None,
+    ) -> RegimeAwareNetworkResult:
+        n_frames, n_dims = state_vectors.shape
+        if dimension_names is None:
+            dimension_names = [f"dim_{i}" for i in range(n_dims)]
+
+        # ------------------------------------------------------------------
+        # Step 1: high-recall candidate detection on full data
+        # ------------------------------------------------------------------
+        original_sync_threshold = self.sync_threshold
+        original_causal_threshold = self.causal_threshold
+        self.sync_threshold = max(0.05, original_sync_threshold * self.candidate_threshold_scale)
+        self.causal_threshold = max(0.05, original_causal_threshold * self.candidate_threshold_scale)
+        try:
+            base_result = super().analyze(state_vectors, dimension_names, window)
+        finally:
+            self.sync_threshold = original_sync_threshold
+            self.causal_threshold = original_causal_threshold
+
+        # ------------------------------------------------------------------
+        # Step 2: generic regimes + contiguous segments
+        # ------------------------------------------------------------------
+        regime_labels = self.regime_detector.detect(state_vectors)
+        segments = self.regime_detector.build_segments(regime_labels)
+        transition_matrix = self.regime_detector.transition_matrix(regime_labels)
+
+        # ------------------------------------------------------------------
+        # Step 3: segment-wise analysis
+        # ------------------------------------------------------------------
+        regime_results: dict[int, list[Any]] = {}
+        segment_causal_counts: dict[tuple[int, int], int] = {}
+        segment_sync_counts: dict[tuple[int, int], int] = {}
+        agg_causal: dict[tuple[int, int], _AggregatedLink] = {}
+        agg_sync: dict[tuple[int, int], _AggregatedLink] = {}
+
+        for seg in segments:
+            seg_data = state_vectors[seg.start : seg.end]
+            if len(seg_data) < max(12, self.regime_detector.config.min_segment_length):
+                continue
+            seg_result = super().analyze(seg_data, dimension_names, window=len(seg_data))
+            regime_results.setdefault(seg.regime_id, []).append(seg_result)
+
+            seen_causal = set()
+            for link in seg_result.causal_network:
+                key = (link.from_dim, link.to_dim)
+                agg_causal.setdefault(key, _AggregatedLink(*key)).add(
+                    strength=link.strength,
+                    correlation=link.correlation,
+                    lag=link.lag,
+                )
+                seen_causal.add(key)
+            for key in seen_causal:
+                segment_causal_counts[key] = segment_causal_counts.get(key, 0) + 1
+
+            seen_sync = set()
+            for link in seg_result.sync_network:
+                a, b = sorted((link.from_dim, link.to_dim))
+                key = (a, b)
+                agg_sync.setdefault(key, _AggregatedLink(a, b)).add(
+                    strength=link.strength,
+                    correlation=link.correlation,
+                    lag=0,
+                )
+                seen_sync.add(key)
+            for key in seen_sync:
+                segment_sync_counts[key] = segment_sync_counts.get(key, 0) + 1
+
+        n_segments = max(1, len(segments))
+
+        # ------------------------------------------------------------------
+        # Step 4: aggregate candidate edges from segment evidence + base result
+        # ------------------------------------------------------------------
+        candidate_causal_links = self._aggregate_candidate_causal_links(
+            agg_causal=agg_causal,
+            segment_counts=segment_causal_counts,
+            n_segments=n_segments,
+            base_result=base_result,
+            dimension_names=dimension_names,
         )
-    )
-    return engine.fit_predict(data)
+        candidate_sync_links = self._aggregate_candidate_sync_links(
+            agg_sync=agg_sync,
+            segment_counts=segment_sync_counts,
+            n_segments=n_segments,
+            base_result=base_result,
+            dimension_names=dimension_names,
+        )
+
+        # ------------------------------------------------------------------
+        # Step 5: inverse-problem refinement for precision recovery
+        # ------------------------------------------------------------------
+        refined_links, evidence = self.inverse_refiner.refine(
+            state_vectors=state_vectors,
+            candidate_links=candidate_causal_links,
+            dimension_names=dimension_names,
+        )
+
+        final_result = self._build_final_network_result(
+            base_result=base_result,
+            sync_links=candidate_sync_links,
+            causal_links=refined_links,
+            dimension_names=dimension_names,
+            state_vectors=state_vectors,
+        )
+
+        edge_frequency = {
+            key: segment_causal_counts.get(key, 0) / n_segments for key in agg_causal.keys()
+        }
+        edge_mean_confidence = {
+            (ev.from_dim, ev.to_dim): ev.confidence for ev in evidence
+        }
+        edge_mean_lag = {
+            key: float(np.mean(agg_causal[key].lags)) if agg_causal[key].lags else 0.0
+            for key in agg_causal.keys()
+        }
+
+        return RegimeAwareNetworkResult(
+            base_result=base_result,
+            final_result=final_result,
+            regime_labels=regime_labels,
+            regime_segments=segments,
+            regime_results=regime_results,
+            refined_evidence=evidence,
+            edge_frequency=edge_frequency,
+            edge_mean_confidence=edge_mean_confidence,
+            edge_mean_lag=edge_mean_lag,
+            regime_transition_matrix=transition_matrix,
+        )
+
+    def _aggregate_candidate_causal_links(
+        self,
+        agg_causal: dict[tuple[int, int], _AggregatedLink],
+        segment_counts: dict[tuple[int, int], int],
+        n_segments: int,
+        base_result: Any,
+        dimension_names: list[str],
+    ) -> list[Any]:
+        out: dict[tuple[int, int], Any] = {}
+
+        # Segment-supported links
+        for key, bucket in agg_causal.items():
+            freq = segment_counts.get(key, 0) / n_segments
+            if freq < self.min_segment_causal_frequency:
+                continue
+            i, j = key
+            out[key] = DimensionLink(
+                from_dim=i,
+                to_dim=j,
+                from_name=dimension_names[i],
+                to_name=dimension_names[j],
+                link_type="causal",
+                strength=float(np.mean(bucket.strengths) * (0.5 + 0.5 * freq)),
+                correlation=float(np.mean(bucket.correlations)),
+                lag=max(1, int(round(np.mean(bucket.lags)))) if bucket.lags else 1,
+            )
+
+        # Full-data candidates are also kept as weak proposals
+        for link in base_result.causal_network:
+            key = (link.from_dim, link.to_dim)
+            if key not in out:
+                out[key] = DimensionLink(
+                    from_dim=link.from_dim,
+                    to_dim=link.to_dim,
+                    from_name=link.from_name,
+                    to_name=link.to_name,
+                    link_type="causal",
+                    strength=max(0.05, 0.8 * link.strength),
+                    correlation=link.correlation,
+                    lag=link.lag,
+                )
+
+        return list(out.values())
+
+    def _aggregate_candidate_sync_links(
+        self,
+        agg_sync: dict[tuple[int, int], _AggregatedLink],
+        segment_counts: dict[tuple[int, int], int],
+        n_segments: int,
+        base_result: Any,
+        dimension_names: list[str],
+    ) -> list[Any]:
+        out: dict[tuple[int, int], Any] = {}
+
+        for key, bucket in agg_sync.items():
+            freq = segment_counts.get(key, 0) / n_segments
+            if freq < self.min_segment_causal_frequency:
+                continue
+            i, j = key
+            out[key] = DimensionLink(
+                from_dim=i,
+                to_dim=j,
+                from_name=dimension_names[i],
+                to_name=dimension_names[j],
+                link_type="sync",
+                strength=float(np.mean(bucket.strengths) * (0.5 + 0.5 * freq)),
+                correlation=float(np.mean(bucket.correlations)),
+                lag=0,
+            )
+
+        for link in base_result.sync_network:
+            key = tuple(sorted((link.from_dim, link.to_dim)))
+            if key not in out:
+                i, j = key
+                out[key] = DimensionLink(
+                    from_dim=i,
+                    to_dim=j,
+                    from_name=dimension_names[i],
+                    to_name=dimension_names[j],
+                    link_type="sync",
+                    strength=link.strength,
+                    correlation=link.correlation,
+                    lag=0,
+                )
+
+        return list(out.values())
+
+    def _build_final_network_result(
+        self,
+        base_result: Any,
+        sync_links: list[Any],
+        causal_links: list[Any],
+        dimension_names: list[str],
+        state_vectors: np.ndarray,
+    ) -> Any:
+        n_dims = state_vectors.shape[1]
+        pattern = self._identify_pattern(sync_links, causal_links)
+        hub_dims = self._detect_hubs(sync_links, causal_links, n_dims)
+        drivers, followers = self._identify_causal_structure(causal_links, n_dims)
+
+        sync_matrix = np.zeros((n_dims, n_dims), dtype=float)
+        causal_matrix = np.zeros((n_dims, n_dims), dtype=float)
+        lag_matrix = np.zeros((n_dims, n_dims), dtype=int)
+
+        for link in sync_links:
+            i, j = link.from_dim, link.to_dim
+            sync_matrix[i, j] = link.correlation
+            sync_matrix[j, i] = link.correlation
+
+        for link in causal_links:
+            i, j = link.from_dim, link.to_dim
+            causal_matrix[i, j] = link.strength
+            causal_matrix[j, i] = link.strength
+            lag_matrix[i, j] = link.lag
+            lag_matrix[j, i] = -link.lag
+
+        return NetworkResult(
+            sync_network=sync_links,
+            causal_network=causal_links,
+            sync_matrix=sync_matrix,
+            causal_matrix=causal_matrix,
+            causal_lag_matrix=lag_matrix,
+            pattern=pattern,
+            hub_dimensions=hub_dims,
+            hub_names=[dimension_names[d] for d in hub_dims],
+            causal_drivers=drivers,
+            causal_followers=followers,
+            driver_names=[dimension_names[d] for d in drivers],
+            follower_names=[dimension_names[d] for d in followers],
+            n_dims=n_dims,
+            n_sync_links=len(sync_links),
+            n_causal_links=len(causal_links),
+            dimension_names=dimension_names,
+            adaptive_params=getattr(base_result, "adaptive_params", None),
+        )
 
 
 # ============================================================================
-# Usage sketch
+# Convenience usage sketch
 # ============================================================================
 #
-# config = InverseCausalEngineConfig(
-#     max_lag=5,
-#     ar_lag=1,
-#     alpha_ridge=1e-2,
-#     alpha_smooth=1e-2,
-#     standardize=True,
-#     validation_fraction=0.25,
-#     apply_textbook_filter=True,
+# analyzer = NetworkAnalyzerCoreV2(
+#     sync_threshold=0.45,
+#     causal_threshold=0.30,
+#     max_lag=12,
+#     adaptive=True,
+#     regime_config=GenericRegimeConfig(
+#         n_regimes=3,
+#         min_segment_length=40,
+#     ),
+#     inverse_config=InverseRefinementConfig(
+#         enabled=True,
+#         kernel_max_lag=8,
+#         ridge_alpha=1e-2,
+#         smooth_alpha=1e-2,
+#         min_delta_mse=1e-4,
+#         min_confidence=0.05,
+#     ),
 # )
+# result_v2 = analyzer.analyze_regime_aware(state_vectors, dimension_names)
+# final_network = result_v2.final_result
+# evidence = result_v2.refined_evidence
 #
-# engine = InverseCausalEngine(config)
-# result = engine.fit(state_vectors, dimension_names=[...])
-# scores = result.score_matrix          # continuous AUC-ready scores, i -> j
-# best_lags = result.lag_matrix         # best lag per directed edge
-# links = result.links                  # sorted edge list
-#
-# For CauseMe-like interfaces:
-# scores = predict_adjacency(state_vectors, max_lag=5)
+# For CauseMe-style evaluation, final_network.causal_network is the key output.
+# Use evidence to rank edges by confidence when sweeping thresholds for ROC/AUC.
 # ============================================================================
