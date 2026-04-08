@@ -50,6 +50,11 @@ class MethodOutput:
 
     meta: dict = field(default_factory=dict)
 
+    def undirected_bin(self) -> np.ndarray | None:
+        if self.adjacency_bin is None:
+            return None
+        return ((self.adjacency_bin + self.adjacency_bin.T) > 0).astype(int)
+
 
 # ============================================================================
 # Original adapter (NetworkAnalyzerCore)
