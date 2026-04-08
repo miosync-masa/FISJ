@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fisj"
-version = "0.7.1"
+version = "0.7.2"
 description = "Domain-agnostic standalone multidimensional network analysis engine based on partial correlation, lagged causality estimation, and common-ancestor filtering."
 readme = "README.md"
 requires-python = ">=3.10"
