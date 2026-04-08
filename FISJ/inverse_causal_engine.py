@@ -6,8 +6,6 @@ from typing import Optional
 
 import numpy as np
 
-from .main import NetworkAnalyzerCore, DimensionLink, NetworkResult
-
 logger = logging.getLogger("getter_one.analysis.inverse_causal_engine")
 
 
