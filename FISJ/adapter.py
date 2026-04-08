@@ -25,6 +25,7 @@ import pandas as pd
 
 from .main import NetworkAnalyzerCore
 from .inverse_causal_engine import InverseCausalEngine, InverseCausalEngineConfig
+from .score_fusion import fuse_scores
 
 
 @dataclass
@@ -310,5 +311,146 @@ class FISJInverseAdapter:
                 "effective_solver": getattr(engine, "_effective_solver", self.solver),
                 "n_links": len(result.links),
                 "has_di": result.direct_score_matrix is not None,
+            },
+        )
+
+
+# ============================================================================
+# Fusion adapter (NetworkAnalyzerCore + InverseCausalEngine + suppress fusion)
+# ============================================================================
+
+
+class FISJFusionAdapter:
+    """
+    Benchmark adapter for FISJ using suppress-mode score fusion.
+
+    Combines:
+      - NetworkAnalyzerCore: raw ranking + q-value (statistical significance)
+      - InverseCausalEngine: DI (structural necessity)
+
+    The q-value acts as a hard suppressor to kill non-significant edges,
+    preserving clean AUC separation while providing theoretically grounded
+    binary thresholding for F-measure.
+
+    Parameters
+    ----------
+    max_lag : int
+        Maximum causal lag to consider.
+    solver : str
+        Solver for InverseCausalEngine: "auto", "ridge", or "lasso".
+    alpha : float
+        FDR threshold for q-value suppression.
+    suppress_floor : float
+        Floor value for non-significant edges (0.0 = hard kill).
+    method_name : str | None
+        Override the default method name in output.
+    """
+
+    method_name = "FISJ-Fusion"
+
+    def __init__(
+        self,
+        max_lag: int = 5,
+        solver: str = "auto",
+        alpha: float = 0.05,
+        suppress_floor: float = 0.05,
+        method_name: str | None = None,
+    ):
+        self.max_lag = max_lag
+        self.solver = solver
+        self.alpha = alpha
+        self.suppress_floor = suppress_floor
+
+        if method_name is not None:
+            self.method_name = method_name
+
+    def fit(
+        self,
+        df: pd.DataFrame,
+        cfg: object | None = None,
+    ) -> MethodOutput:
+        """
+        Run fusion causal analysis on a DataFrame.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Each column represents one time-series dimension.
+        cfg : object, optional
+            Benchmark framework configuration (accepted for interface
+            compatibility but not used).
+
+        Returns
+        -------
+        MethodOutput
+            Standardized analysis result.
+        """
+        names = list(df.columns)
+        n = len(names)
+        state_vectors = df.values.astype(np.float64)
+
+        # Engine 1: NetworkAnalyzerCore (raw score + q-value source)
+        nac = NetworkAnalyzerCore(
+            max_lag=self.max_lag,
+            adaptive=False,
+            p_value_threshold=self.alpha,
+        )
+        nac_result = nac.analyze(
+            state_vectors=state_vectors,
+            dimension_names=names,
+        )
+
+        # Engine 2: InverseCausalEngine (DI only)
+        ice_config = InverseCausalEngineConfig(
+            max_lag=self.max_lag,
+            ar_lag=1,
+            solver=self.solver,
+            standardize=True,
+            include_intercept=True,
+            validation_fraction=0.25,
+            use_backward_check=True,
+            compute_direct_irreducibility=True,
+        )
+        ice_result = InverseCausalEngine(ice_config).fit(
+            state_vectors, dimension_names=names,
+        )
+
+        # Fusion (suppress mode)
+        n_samples = state_vectors.shape[0] - self.max_lag
+        raw_score = np.abs(nac_result.causal_matrix)
+        np.fill_diagonal(raw_score, 0.0)
+
+        fusion = fuse_scores(
+            raw_score_matrix=raw_score,
+            direct_score_matrix=ice_result.direct_score_matrix,
+            causal_matrix=nac_result.causal_matrix,
+            lag_matrix=nac_result.causal_lag_matrix,
+            n_samples=n_samples,
+            max_lag=self.max_lag,
+            fusion_mode="suppress",
+            alpha=self.alpha,
+            suppress_floor=self.suppress_floor,
+        )
+
+        scores = fusion.fused_score_matrix.copy()
+        adjacency = fusion.binary_matrix.astype(int)
+
+        return MethodOutput(
+            method_name=self.method_name,
+            names=names,
+            adjacency_scores=scores,
+            adjacency_bin=adjacency,
+            directed_support=True,
+            lag_support=True,
+            sign_support=True,
+            lag_matrix=ice_result.lag_matrix,
+            sign_matrix=ice_result.sign_matrix,
+            meta={
+                "fusion_mode": "suppress",
+                "alpha": self.alpha,
+                "suppress_floor": self.suppress_floor,
+                "n_sig_edges": int(np.sum(fusion.q_matrix < self.alpha)),
+                "n_binary_edges": int(np.sum(adjacency)),
+                "has_di": ice_result.direct_score_matrix is not None,
             },
         )
