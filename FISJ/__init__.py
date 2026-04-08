@@ -1,5 +1,5 @@
 from .main import NetworkAnalyzerCore, NetworkResult, DimensionLink, CooperativeEventNetwork
-from .adapter import FISJAdapter, MethodOutput
+from .adapter import FISJAdapter, FISJInverseAdapter, MethodOutput
 from .network_analyzer_core_v2 import (
     NetworkAnalyzerCoreV2,
     GenericRegimeConfig,
@@ -16,6 +16,7 @@ from .inverse_causal_engine import (
     InverseCausalResult,
     InverseCausalLink,
     TargetFitSummary,
+    DirectIrreducibilityScorer,
     predict_adjacency,
 )
 
@@ -25,6 +26,7 @@ __all__ = [
     "DimensionLink",
     "CooperativeEventNetwork",
     "FISJAdapter",
+    "FISJInverseAdapter",
     "MethodOutput",
     "NetworkAnalyzerCoreV2",
     "GenericRegimeConfig",
@@ -39,5 +41,6 @@ __all__ = [
     "InverseCausalResult",
     "InverseCausalLink",
     "TargetFitSummary",
+    "DirectIrreducibilityScorer",
     "predict_adjacency",
 ]
