@@ -3,16 +3,17 @@ FISJ Adapter - Benchmark-Ready Interface
 ==========================================
 Built by Masamichi & Tamaki
 
-A thin adapter that wraps NetworkAnalyzerCore for direct use with
-causal discovery benchmark frameworks. No external pipeline dependency.
+Two adapters:
+  - FISJAdapter       : Original NetworkAnalyzerCore-based (partial correlation)
+  - FISJInverseAdapter: InverseCausalEngine-based (auto Ridge/Lasso + DI)
 
 Usage
 -----
->>> from FISJ import FISJAdapter
->>> adapter = FISJAdapter()
+>>> from FISJ import FISJInverseAdapter
+>>> adapter = FISJInverseAdapter()
 >>> result = adapter.fit(df)
->>> result.adjacency_bin   # (n, n) binary adjacency
->>> result.lag_matrix       # (n, n) optimal lag
+>>> result.adjacency_scores   # (n, n) continuous causal scores
+>>> result.lag_matrix          # (n, n) optimal lag
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from .main import NetworkAnalyzerCore
+from .inverse_causal_engine import InverseCausalEngine, InverseCausalEngineConfig
 
 
 @dataclass
@@ -49,27 +51,17 @@ class MethodOutput:
     meta: dict = field(default_factory=dict)
 
 
+# ============================================================================
+# Original adapter (NetworkAnalyzerCore)
+# ============================================================================
+
+
 class FISJAdapter:
     """
-    Benchmark adapter for FISJ.
+    Benchmark adapter for FISJ using NetworkAnalyzerCore.
 
     Accepts a pandas DataFrame, runs NetworkAnalyzerCore, and returns
     a MethodOutput. No external pipeline dependency.
-
-    Parameters
-    ----------
-    sync_threshold : float
-        Synchronization threshold (adaptive hint if adaptive=True).
-    causal_threshold : float
-        Causal link threshold (adaptive hint if adaptive=True).
-    max_lag : int
-        Maximum lag in frames (adaptive hint if adaptive=True).
-    adaptive : bool
-        Enable data-driven adaptive parameter tuning.
-    local_std_window : int
-        Rolling window size for local standard deviation computation.
-    method_name : str | None
-        Override the default method name in output.
     """
 
     method_name = "FISJ"
@@ -111,8 +103,7 @@ class FISJAdapter:
         Returns
         -------
         MethodOutput
-            Standardized analysis result with adjacency, lag, and sign
-            matrices.
+            Standardized analysis result.
         """
         names = list(df.columns)
         n = len(names)
@@ -171,5 +162,145 @@ class FISJAdapter:
                 "hub_names": result.hub_names,
                 "driver_names": result.driver_names,
                 "follower_names": result.follower_names,
+            },
+        )
+
+
+# ============================================================================
+# Inverse Causal Engine adapter (auto Ridge/Lasso + Direct Irreducibility)
+# ============================================================================
+
+
+class FISJInverseAdapter:
+    """
+    Benchmark adapter for FISJ using InverseCausalEngine.
+
+    Auto-selects solver (Ridge/Lasso) and post-processing (Direct
+    Irreducibility) based on data characteristics via DataGate.
+
+    Parameters
+    ----------
+    max_lag : int
+        Maximum causal lag to consider.
+    solver : str
+        "auto" (recommended), "ridge", or "lasso".
+    score_mode : str
+        Score composition mode: "mixed", "block_norm", "delta_mse".
+    binary_threshold : float | None
+        Threshold on adjacency_scores for binary adjacency.
+        If None, uses detected links from engine.
+    method_name : str | None
+        Override the default method name in output.
+    **engine_kwargs
+        Additional keyword arguments passed to InverseCausalEngineConfig.
+    """
+
+    method_name = "FISJ-Inverse"
+
+    def __init__(
+        self,
+        max_lag: int = 5,
+        solver: str = "auto",
+        score_mode: str = "mixed",
+        binary_threshold: float | None = None,
+        method_name: str | None = None,
+        **engine_kwargs,
+    ):
+        self.max_lag = max_lag
+        self.solver = solver
+        self.score_mode = score_mode
+        self.binary_threshold = binary_threshold
+        self.engine_kwargs = engine_kwargs
+
+        if method_name is not None:
+            self.method_name = method_name
+
+    def fit(
+        self,
+        df: pd.DataFrame,
+        cfg: object | None = None,
+    ) -> MethodOutput:
+        """
+        Run inverse-problem causal analysis on a DataFrame.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Each column represents one time-series dimension.
+        cfg : object, optional
+            Benchmark framework configuration (accepted for interface
+            compatibility but not used).
+
+        Returns
+        -------
+        MethodOutput
+            Standardized analysis result with adjacency, lag, and sign
+            matrices.
+        """
+        names = list(df.columns)
+        n = len(names)
+        state_vectors = df.values.astype(np.float64)
+
+        # Build engine config with defaults + user overrides
+        config_params = dict(
+            max_lag=self.max_lag,
+            ar_lag=1,
+            solver=self.solver,
+            score_mode=self.score_mode,
+            standardize=True,
+            include_intercept=True,
+            validation_fraction=0.25,
+            use_backward_check=True,
+            # auto routing handles these via _select_pipeline:
+            apply_textbook_filter=False,
+            compute_direct_irreducibility=True,
+        )
+        config_params.update(self.engine_kwargs)
+
+        config = InverseCausalEngineConfig(**config_params)
+        engine = InverseCausalEngine(config)
+        result = engine.fit(state_vectors, dimension_names=names)
+
+        # --- Score selection ---
+        # Use direct_score_matrix (DI) when available, else raw
+        if result.direct_score_matrix is not None:
+            scores = result.direct_score_matrix.copy()
+        else:
+            scores = result.score_matrix_unfiltered.copy()
+        np.fill_diagonal(scores, 0.0)
+
+        # --- Binary adjacency ---
+        if self.binary_threshold is not None:
+            adjacency = (scores > self.binary_threshold).astype(int)
+        else:
+            # Use detected links from engine
+            adjacency = np.zeros((n, n), dtype=int)
+            for link in result.links:
+                adjacency[link.from_dim, link.to_dim] = 1
+
+        np.fill_diagonal(adjacency, 0)
+
+        # --- Lag and sign matrices ---
+        lagm = result.lag_matrix.copy()
+        signm = result.sign_matrix.copy()
+
+        return MethodOutput(
+            method_name=self.method_name,
+            names=names,
+            adjacency_scores=scores,
+            adjacency_bin=adjacency,
+            directed_support=True,
+            lag_support=True,
+            sign_support=True,
+            lag_matrix=lagm,
+            sign_matrix=signm,
+            meta={
+                "gate_regime": result.gate.regime,
+                "gate_mean_corr": result.gate.mean_corr,
+                "gate_max_corr": result.gate.max_corr,
+                "gate_feature_sample_ratio": result.gate.feature_sample_ratio,
+                "effective_solver": getattr(engine, "_effective_solver", self.solver),
+                "n_links": len(result.links),
+                "has_di": result.direct_score_matrix is not None,
             },
         )
