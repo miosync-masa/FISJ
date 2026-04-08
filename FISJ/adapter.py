@@ -449,6 +449,7 @@ class FISJFusionAdapter:
                 "fusion_mode": "suppress",
                 "alpha": self.alpha,
                 "suppress_floor": self.suppress_floor,
+                "q_matrix": fusion.q_matrix,
                 "n_sig_edges": int(np.sum(fusion.q_matrix < self.alpha)),
                 "n_binary_edges": int(np.sum(adjacency)),
                 "has_di": ice_result.direct_score_matrix is not None,
