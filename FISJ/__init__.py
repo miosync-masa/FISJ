@@ -3,11 +3,8 @@ from .adapter import FISJAdapter, FISJInverseAdapter, MethodOutput
 from .network_analyzer_core_v2 import (
     NetworkAnalyzerCoreV2,
     GenericRegimeConfig,
-    InverseRefinementConfig,
     GenericRegimeDetector,
-    InverseCausalRefiner,
-    RegimeAwareNetworkResult,
-    RefinedEdgeEvidence,
+    RegimeAwareResult,
     RegimeSegment,
 )
 from .inverse_causal_engine import (
@@ -18,6 +15,11 @@ from .inverse_causal_engine import (
     TargetFitSummary,
     DirectIrreducibilityScorer,
     predict_adjacency,
+)
+from .score_fusion import (
+    fuse_scores,
+    FusionResult,
+    compute_causal_q_matrix,
 )
 
 __all__ = [
@@ -30,11 +32,8 @@ __all__ = [
     "MethodOutput",
     "NetworkAnalyzerCoreV2",
     "GenericRegimeConfig",
-    "InverseRefinementConfig",
     "GenericRegimeDetector",
-    "InverseCausalRefiner",
-    "RegimeAwareNetworkResult",
-    "RefinedEdgeEvidence",
+    "RegimeAwareResult",
     "RegimeSegment",
     "InverseCausalEngine",
     "InverseCausalEngineConfig",
@@ -43,4 +42,7 @@ __all__ = [
     "TargetFitSummary",
     "DirectIrreducibilityScorer",
     "predict_adjacency",
+    "fuse_scores",
+    "FusionResult",
+    "compute_causal_q_matrix",
 ]
