@@ -10,6 +10,14 @@ from .network_analyzer_core_v2 import (
     RefinedEdgeEvidence,
     RegimeSegment,
 )
+from .inverse_causal_engine import (
+    InverseCausalEngine,
+    InverseCausalEngineConfig,
+    InverseCausalResult,
+    InverseCausalLink,
+    TargetFitSummary,
+    predict_adjacency,
+)
 
 __all__ = [
     "NetworkAnalyzerCore",
@@ -26,4 +34,10 @@ __all__ = [
     "RegimeAwareNetworkResult",
     "RefinedEdgeEvidence",
     "RegimeSegment",
+    "InverseCausalEngine",
+    "InverseCausalEngineConfig",
+    "InverseCausalResult",
+    "InverseCausalLink",
+    "TargetFitSummary",
+    "predict_adjacency",
 ]
