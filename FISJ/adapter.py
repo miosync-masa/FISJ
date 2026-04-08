@@ -281,7 +281,7 @@ class FISJInverseAdapter:
             # Adaptive binarization: percentile of nonzero scores
             nonzero = scores[scores > 0]
             if len(nonzero) > 0:
-                thr = float(np.percentile(nonzero, 50))
+                thr = float(np.percentile(nonzero, 65))
                 adjacency = (scores > thr).astype(int)
             else:
                 adjacency = np.zeros((n, n), dtype=int)
