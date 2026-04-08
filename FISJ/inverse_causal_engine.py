@@ -71,6 +71,7 @@ class InverseCausalResult:
 
     links: list[InverseCausalLink]
     score_matrix: np.ndarray
+    score_matrix_unfiltered: np.ndarray  # フィルタ前（AUC用）
     lag_matrix: np.ndarray
     sign_matrix: np.ndarray
     confidence_matrix: np.ndarray
@@ -90,11 +91,13 @@ class InverseCausalEngineConfig:
     ar_lag: int = 1
     alpha_ridge: float = 1e-2
     alpha_smooth: float = 1e-2
+    adaptive_regularization: bool = True  # N/T依存の正則化
     standardize: bool = True
     include_intercept: bool = True
     validation_fraction: float = 0.25
     min_train_size: int = 40
     min_effect: float = 1e-6
+    score_mode: str = "block_norm"  # "block_norm", "delta_mse", "mixed"
     score_mix: float = 0.65
     confidence_mix: float = 0.35
     asymmetry_weight: float = 0.25
@@ -106,6 +109,7 @@ class InverseCausalEngineConfig:
     common_ancestor_strength_ratio: float = 0.95
     mediated_path_strength_ratio: float = 0.85
     lag_tolerance: int = 1
+    residualize_ar: bool = True  # 自己回帰を先に引いてからcross-node solve
     eps: float = 1e-12
 
 
@@ -213,6 +217,9 @@ class InverseCausalEngine:
             dimension_names=dimension_names,
         )
 
+        # フィルタ前のscoreを保存（AUC用連続値ランキング）
+        score_unfiltered = score.copy()
+
         if self.config.prune_by_confidence:
             links = self._prune_by_confidence(links)
             score, lag, sign, block_norm, delta_mse, confidence = self._rebuild_matrices_from_links(
@@ -232,6 +239,7 @@ class InverseCausalEngine:
         return InverseCausalResult(
             links=links,
             score_matrix=score,
+            score_matrix_unfiltered=score_unfiltered,
             lag_matrix=lag,
             sign_matrix=sign,
             confidence_matrix=confidence,
@@ -270,11 +278,57 @@ class InverseCausalEngine:
         y_train, y_val = y[:split], y[split:]
         X_train, X_val = X_full[:split], X_full[split:]
 
-        # Fit full forward model
-        w_full = self._solve_regularized(X_train, y_train, meta)
-        yhat_val = X_val @ w_full
-        baseline_mse = self._mse(y_val, yhat_val)
-        null_mse = self._mse(y_val, np.full_like(y_val, np.mean(y_train)))
+        # --- Two-stage AR residualization ---
+        if self.config.residualize_ar and meta["self_cols"]:
+            self_cols = meta["self_cols"]
+            X_self_train = X_train[:, self_cols]
+            X_self_val = X_val[:, self_cols]
+
+            # Stage 1: fit self-AR
+            w_ar = np.linalg.lstsq(X_self_train, y_train, rcond=None)[0]
+            self_kernel = w_ar.copy()
+
+            # Compute residuals
+            y_train_resid = y_train - X_self_train @ w_ar
+            y_val_resid = y_val - X_self_val @ w_ar
+
+            # Stage 2: solve cross-node on residuals (no self cols)
+            source_col_list = []
+            for cols in meta["source_cols"].values():
+                source_col_list.extend(cols)
+
+            if source_col_list:
+                X_src_train = X_train[:, source_col_list]
+                X_src_val = X_val[:, source_col_list]
+
+                # Remap meta for source-only solve
+                meta_src = self._reduce_meta(meta, source_col_list)
+                meta_src["self_cols"] = []  # no self in this stage
+
+                w_src = self._solve_regularized(X_src_train, y_train_resid, meta_src)
+
+                # Reconstruct full weight vector
+                w_full = np.zeros(X_full.shape[1])
+                w_full[self_cols] = w_ar
+                for idx, col in enumerate(source_col_list):
+                    w_full[col] = w_src[idx]
+
+                yhat_val = X_val @ w_full
+                baseline_mse = self._mse(y_val, yhat_val)
+            else:
+                w_full = np.zeros(X_full.shape[1])
+                w_full[self_cols] = w_ar
+                baseline_mse = self._mse(y_val, X_self_val @ w_ar)
+
+            null_mse = self._mse(y_val, np.full_like(y_val, np.mean(y_train)))
+
+        else:
+            # --- Original single-stage solve ---
+            w_full = self._solve_regularized(X_train, y_train, meta)
+            yhat_val = X_val @ w_full
+            baseline_mse = self._mse(y_val, yhat_val)
+            null_mse = self._mse(y_val, np.full_like(y_val, np.mean(y_train)))
+            self_kernel = self._extract_self_kernel(w_full, meta)
 
         # Optional backward model for direction asymmetry
         backward_info = None
@@ -298,7 +352,7 @@ class InverseCausalEngine:
                     "baseline_mse": mse_b_full,
                 }
 
-        self_kernel = self._extract_self_kernel(w_full, meta)
+        # self_kernel は上のif/elseで設定済み
         source_kernels = self._extract_source_kernels(w_full, meta)
 
         source_delta_mse_forward: dict[int, float] = {}
@@ -433,23 +487,32 @@ class InverseCausalEngine:
         lag_smoothness is applied independently to each block (self block and each source block)
         using a discrete first-difference penalty.
         """
+        n_samples = X.shape[0]
         p = X.shape[1]
         if p == 0:
             return np.zeros(0, dtype=float)
 
+        # Adaptive regularization: scale with sqrt(log(p) / T)
+        if self.config.adaptive_regularization and n_samples > 0 and p > 0:
+            adaptive_scale = float(np.sqrt(np.log(max(p, 2)) / max(n_samples, 1)))
+            alpha_ridge = self.config.alpha_ridge * adaptive_scale / 0.1  # normalize so ~1x at p=46,T=300
+            alpha_smooth = self.config.alpha_smooth * adaptive_scale / 0.1
+        else:
+            alpha_ridge = self.config.alpha_ridge
+            alpha_smooth = self.config.alpha_smooth
+
         xtx = X.T @ X
         xty = X.T @ y
-        reg = self.config.alpha_ridge * np.eye(p, dtype=float)
+        reg = alpha_ridge * np.eye(p, dtype=float)
 
         def add_smooth_block(cols: list[int]) -> None:
-            if len(cols) < 2 or self.config.alpha_smooth <= 0:
+            if len(cols) < 2 or alpha_smooth <= 0:
                 return
-            lam = self.config.alpha_smooth
             for a, b in zip(cols[:-1], cols[1:]):
-                reg[a, a] += lam
-                reg[b, b] += lam
-                reg[a, b] -= lam
-                reg[b, a] -= lam
+                reg[a, a] += alpha_smooth
+                reg[b, b] += alpha_smooth
+                reg[a, b] -= alpha_smooth
+                reg[b, a] -= alpha_smooth
 
         add_smooth_block(meta["self_cols"])
         for source, cols in meta["source_cols"].items():
@@ -503,11 +566,20 @@ class InverseCausalEngine:
         """
         Build the final continuous score matrix.
 
-        Default behavior:
-          score = score_mix * normalized(block_norm)
-                + (1-score_mix) * normalized(positive delta_mse)
-        with optional confidence contribution blended inside delta component.
+        score_mode controls the composition:
+          "block_norm" : block norm only (simplest, best for AUC ranking)
+          "delta_mse"  : delta MSE only (prediction importance)
+          "mixed"      : weighted combination of all components
         """
+        mode = self.config.score_mode
+
+        if mode == "block_norm":
+            return self._normalize_positive(block_norm)
+
+        if mode == "delta_mse":
+            return self._normalize_positive(np.maximum(delta_mse, 0.0))
+
+        # mixed (default fallback)
         bn = self._normalize_positive(block_norm)
         dm = self._normalize_positive(np.maximum(delta_mse, 0.0))
         cf = self._normalize_positive(np.maximum(confidence, 0.0))
@@ -550,7 +622,7 @@ class InverseCausalEngine:
                         best_lag=int(lag_matrix[source, target]),
                         block_norm=float(block_norm_matrix[source, target]),
                         delta_mse_forward=float(delta_mse_matrix[source, target]),
-                        delta_mse_backward=0.0,  # reconstructed later if needed
+                        delta_mse_backward=0.0,
                         asymmetry=0.0,
                         confidence=float(confidence_matrix[source, target]),
                     )
@@ -746,42 +818,18 @@ def predict_adjacency(data: np.ndarray, max_lag: int) -> np.ndarray:
             ar_lag=1,
             alpha_ridge=1e-2,
             alpha_smooth=1e-2,
+            adaptive_regularization=True,
             standardize=True,
             include_intercept=True,
             validation_fraction=0.25,
             min_train_size=max(20, 2 * max_lag),
-            score_mix=0.70,
-            confidence_mix=0.35,
+            score_mode="block_norm",
             asymmetry_weight=0.25,
             use_backward_check=True,
             refit_on_drop=False,
             prune_by_confidence=False,
-            apply_textbook_filter=True,
+            apply_textbook_filter=False,  # AUC用はフィルタなし
         )
     )
-    return engine.fit_predict(data)
-
-
-# ============================================================================
-# Usage sketch
-# ============================================================================
-#
-# config = InverseCausalEngineConfig(
-#     max_lag=5,
-#     ar_lag=1,
-#     alpha_ridge=1e-2,
-#     alpha_smooth=1e-2,
-#     standardize=True,
-#     validation_fraction=0.25,
-#     apply_textbook_filter=True,
-# )
-#
-# engine = InverseCausalEngine(config)
-# result = engine.fit(state_vectors, dimension_names=[...])
-# scores = result.score_matrix          # continuous AUC-ready scores, i -> j
-# best_lags = result.lag_matrix         # best lag per directed edge
-# links = result.links                  # sorted edge list
-#
-# For CauseMe-like interfaces:
-# scores = predict_adjacency(state_vectors, max_lag=5)
-# ============================================================================
+    result = engine.fit(data)
+    return result.score_matrix_unfiltered
