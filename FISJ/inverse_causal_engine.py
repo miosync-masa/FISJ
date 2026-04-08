@@ -66,6 +66,18 @@ class TargetFitSummary:
 
 
 @dataclass
+class DataGate:
+    """Pre-scan data characteristics for adaptive pipeline routing."""
+
+    mean_corr: float          # 次元間平均絶対相関
+    max_corr: float           # 最大ペア相関
+    n_dims: int
+    n_frames: int
+    feature_sample_ratio: float  # 特徴量数 / サンプル数
+    regime: str               # "weak", "moderate", "strong"
+
+
+@dataclass
 class InverseCausalResult:
     """Full engine output."""
 
@@ -77,6 +89,7 @@ class InverseCausalResult:
     confidence_matrix: np.ndarray
     block_norm_matrix: np.ndarray
     delta_mse_matrix: np.ndarray
+    gate: DataGate
     target_summaries: list[TargetFitSummary]
     dimension_names: list[str]
     max_lag: int
@@ -171,6 +184,13 @@ class InverseCausalEngine:
         if dimension_names is None:
             dimension_names = [f"dim_{i}" for i in range(n_dims)]
 
+        # --- Gate: データ特性のpre-scan ---
+        gate = self._compute_gate(state_vectors)
+        logger.info(
+            f"Gate: regime={gate.regime} mean_corr={gate.mean_corr:.3f} "
+            f"N={gate.n_dims} T={gate.n_frames} feat/sample={gate.feature_sample_ratio:.2f}"
+        )
+
         block_norm = np.zeros((n_dims, n_dims), dtype=float)
         score = np.zeros((n_dims, n_dims), dtype=float)
         lag = np.zeros((n_dims, n_dims), dtype=int)
@@ -248,6 +268,7 @@ class InverseCausalEngine:
             confidence_matrix=confidence,
             block_norm_matrix=block_norm,
             delta_mse_matrix=delta_mse,
+            gate=gate,
             target_summaries=summaries,
             dimension_names=dimension_names,
             max_lag=self.config.max_lag,
@@ -261,6 +282,49 @@ class InverseCausalEngine:
     def predict_adjacency(self, state_vectors: np.ndarray, dimension_names: Optional[list[str]] = None) -> np.ndarray:
         """Alias for benchmark-style usage."""
         return self.fit_predict(state_vectors, dimension_names)
+
+    # ---------------------------------------------------------------------
+    # Gate: data pre-scan
+    # ---------------------------------------------------------------------
+
+    def _compute_gate(self, state_vectors: np.ndarray) -> DataGate:
+        """
+        Pre-scan data characteristics before solving.
+
+        Computes correlation structure to determine regime:
+          weak:     mean_corr < 0.10
+          moderate: 0.10 <= mean_corr < 0.20
+          strong:   mean_corr >= 0.20
+        """
+        n_frames, n_dims = state_vectors.shape
+
+        # Correlation matrix
+        corr = np.corrcoef(state_vectors.T)
+        upper = corr[np.triu_indices(n_dims, k=1)]
+        mean_corr = float(np.mean(np.abs(upper)))
+        max_corr = float(np.max(np.abs(upper))) if len(upper) > 0 else 0.0
+
+        # Feature/sample ratio
+        n_features = self.config.ar_lag + (n_dims - 1) * self.config.max_lag
+        n_samples = n_frames - max(self.config.max_lag, self.config.ar_lag)
+        feat_ratio = n_features / max(n_samples, 1)
+
+        # Regime classification
+        if mean_corr < 0.10:
+            regime = "weak"
+        elif mean_corr < 0.20:
+            regime = "moderate"
+        else:
+            regime = "strong"
+
+        return DataGate(
+            mean_corr=mean_corr,
+            max_corr=max_corr,
+            n_dims=n_dims,
+            n_frames=n_frames,
+            feature_sample_ratio=feat_ratio,
+            regime=regime,
+        )
 
     # ---------------------------------------------------------------------
     # Core fitting
