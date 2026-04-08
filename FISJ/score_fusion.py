@@ -225,50 +225,37 @@ def fuse_scores(
     # --- From V2 Regime-Aware (optional) ---
     frequency_matrix: np.ndarray | None = None,
     # --- Fusion parameters ---
+    fusion_mode: str = "suppress",
     w_raw: float = 0.50,
     w_stat: float = 0.25,
     w_struct: float = 0.25,
     w_freq: float = 0.0,
     alpha: float = 0.05,
+    suppress_floor: float = 0.05,
     tau_fused: float | None = None,
     eps: float = 1e-300,
 ) -> FusionResult:
     """
     Fuse independent causal evidence streams.
 
-    Supports 3-evidence (raw + stat + struct) or 4-evidence
-    (+ segment frequency) geometric mean fusion.
+    Two fusion modes:
 
-    When frequency_matrix is provided and w_freq > 0, weights are
-    automatically renormalized to sum to 1.
+    "suppress" (default):
+        Uses q-value as a hard suppressor to kill non-significant edges.
+        Best for AUC — preserves clean separation between true/false.
+            S = raw * DI_gate * suppressor
+            suppressor = 1.0 if q < alpha, else suppress_floor
 
-    AUC score: rank-normalized geometric mean
-        S = s_raw^w_r · s_stat^w_q · s_struct^w_d [· s_freq^w_f]
+    "geometric":
+        Rank-normalized geometric mean. All evidence treated equally.
+            S = s_raw^w_r · s_stat^w_q · s_struct^w_d
 
-    Binary graph: AND condition
+    Binary graph (both modes): AND condition
         edge = (q < alpha) AND (S > tau)
-
-    Parameters
-    ----------
-    raw_score_matrix : inverse engine の score_matrix_unfiltered
-    direct_score_matrix : inverse engine の direct_score_matrix (DI)
-    causal_matrix : NetworkAnalyzerCore の causal_matrix
-    lag_matrix : NetworkAnalyzerCore の causal_lag_matrix
-    n_samples : effective sample count for p-value computation
-    max_lag : maximum lag tested
-    frequency_matrix : V2 regime-aware の causal_frequency_matrix
-    w_raw, w_stat, w_struct, w_freq : geometric mean weights
-    alpha : FDR threshold for binary graph
-    tau_fused : fused score threshold for binary graph (auto if None)
-    eps : floor for log(q) computation
-
-    Returns
-    -------
-    FusionResult
     """
     n_dims = raw_score_matrix.shape[0]
 
-    # --- Step 1: q-value matrix from NetworkAnalyzerCore's correlation ---
+    # --- Step 1: q-value matrix ---
     p_matrix, q_matrix = compute_causal_q_matrix(
         causal_matrix=causal_matrix,
         lag_matrix=lag_matrix,
@@ -285,46 +272,57 @@ def fuse_scores(
     )
     np.fill_diagonal(struct_matrix, 0.0)
 
-    # --- Step 3: Rank-normalize all sources ---
+    # --- Step 3: Rank-normalize (used by both modes for diagnostics) ---
     s_raw = _ranknorm(np.maximum(raw_score_matrix, 0.0))
-
     neg_log_q = -np.log10(q_matrix + eps)
     np.fill_diagonal(neg_log_q, 0.0)
     s_stat = _ranknorm(neg_log_q)
-
     s_struct = _ranknorm(np.maximum(struct_matrix, 0.0))
 
-    # Frequency (4th evidence, optional)
     use_freq = frequency_matrix is not None and w_freq > 0
-    s_freq = None
-    if use_freq:
-        s_freq = _ranknorm(np.maximum(frequency_matrix, 0.0))
+    s_freq = _ranknorm(np.maximum(frequency_matrix, 0.0)) if use_freq else None
 
-    # --- Step 4: Normalize weights ---
-    if use_freq:
-        w_total = w_raw + w_stat + w_struct + w_freq
-        wr = w_raw / w_total
-        wq = w_stat / w_total
-        wd = w_struct / w_total
-        wf = w_freq / w_total
-    else:
-        w_total = w_raw + w_stat + w_struct
-        wr = w_raw / w_total
-        wq = w_stat / w_total
-        wd = w_struct / w_total
-        wf = 0.0
+    # --- Step 4: Fusion ---
+    if fusion_mode == "suppress":
+        # q-value as hard suppressor: significant → 1.0, else → floor
+        suppressor = np.where(q_matrix < alpha, 1.0, suppress_floor)
+        np.fill_diagonal(suppressor, 0.0)
 
-    # --- Step 5: Geometric mean fusion ---
-    fused = (
-        np.power(np.maximum(s_raw, eps), wr)
-        * np.power(np.maximum(s_stat, eps), wq)
-        * np.power(np.maximum(s_struct, eps), wd)
-    )
-    if use_freq and s_freq is not None:
-        fused *= np.power(np.maximum(s_freq, eps), wf)
-    np.fill_diagonal(fused, 0.0)
+        # DI as soft gate: same idea as DirectIrreducibilityScorer
+        raw_norm = np.maximum(raw_score_matrix, 0.0)
+        raw_max = raw_norm.max()
+        if raw_max > 0:
+            raw_norm = raw_norm / raw_max
 
-    # --- Step 6: Binary graph (AND condition) ---
+        struct_norm = np.maximum(struct_matrix, 0.0)
+        struct_max = struct_norm.max()
+        if struct_max > 0:
+            struct_norm = struct_norm / struct_max
+
+        # Blend: raw base + DI boost, then suppress
+        di_gate = 0.7 + 0.3 * struct_norm
+        fused = raw_norm * di_gate * suppressor
+        np.fill_diagonal(fused, 0.0)
+
+    else:  # "geometric"
+        if use_freq:
+            w_total = w_raw + w_stat + w_struct + w_freq
+            wr, wq, wd, wf = w_raw/w_total, w_stat/w_total, w_struct/w_total, w_freq/w_total
+        else:
+            w_total = w_raw + w_stat + w_struct
+            wr, wq, wd = w_raw/w_total, w_stat/w_total, w_struct/w_total
+            wf = 0.0
+
+        fused = (
+            np.power(np.maximum(s_raw, eps), wr)
+            * np.power(np.maximum(s_stat, eps), wq)
+            * np.power(np.maximum(s_struct, eps), wd)
+        )
+        if use_freq and s_freq is not None:
+            fused *= np.power(np.maximum(s_freq, eps), wf)
+        np.fill_diagonal(fused, 0.0)
+
+    # --- Step 5: Binary graph (AND condition) ---
     if tau_fused is None:
         nonzero = fused[fused > 0]
         tau_fused = float(np.percentile(nonzero, 50)) if len(nonzero) > 0 else 0.0
@@ -337,21 +335,23 @@ def fuse_scores(
             if q_matrix[i, j] < alpha and fused[i, j] > tau_fused:
                 binary[i, j] = 1.0
 
-    # --- Step 7: Consensus ranking (Borda-style backup) ---
-    consensus = wr * s_raw + wq * s_stat + wd * s_struct
+    # --- Step 6: Consensus ranking (backup) ---
+    w_total = w_raw + w_stat + w_struct
+    wr_c, wq_c, wd_c = w_raw/w_total, w_stat/w_total, w_struct/w_total
+    consensus = wr_c * s_raw + wq_c * s_stat + wd_c * s_struct
     if use_freq and s_freq is not None:
-        consensus += wf * s_freq
+        consensus = consensus * 0.8 + 0.2 * s_freq
     np.fill_diagonal(consensus, 0.0)
 
-    weights = {"raw": wr, "stat": wq, "struct": wd}
+    weights = {"raw": w_raw, "stat": w_stat, "struct": w_struct, "mode": fusion_mode}
     if use_freq:
-        weights["freq"] = wf
+        weights["freq"] = w_freq
 
+    n_sig = int(np.sum(q_matrix < alpha))
+    n_bin = int(np.sum(binary))
     logger.info(
-        f"🔗 Score Fusion: n_dims={n_dims}, "
-        f"weights={weights}, "
-        f"q<{alpha}: {int(np.sum(q_matrix < alpha))} edges, "
-        f"binary: {int(np.sum(binary))} edges, "
+        f"🔗 Score Fusion ({fusion_mode}): n_dims={n_dims}, "
+        f"q<{alpha}: {n_sig} edges, binary: {n_bin} edges, "
         f"tau_fused={tau_fused:.4f}"
     )
 
