@@ -94,6 +94,11 @@ class InverseCausalResult:
     dimension_names: list[str]
     max_lag: int
     ar_lag: int
+    # --- Direct Irreducibility (post-solver layer) ---
+    necessity_matrix: np.ndarray | None = None
+    indirect_support_matrix: np.ndarray | None = None
+    direct_irreducibility_matrix: np.ndarray | None = None
+    direct_score_matrix: np.ndarray | None = None
 
 
 @dataclass
@@ -127,6 +132,113 @@ class InverseCausalEngineConfig:
     lag_tolerance: int = 1
     residualize_ar: bool = True  # 自己回帰を先に引いてからcross-node solve
     eps: float = 1e-12
+    # --- Direct Irreducibility ---
+    compute_direct_irreducibility: bool = True
+    di_alpha_raw: float = 0.35
+    di_lambda_indirect: float = 1.0
+    di_lag_tau: float = 1.0
+
+
+# ============================================================================
+# Direct Irreducibility Scorer (post-solver layer)
+# ============================================================================
+
+
+class DirectIrreducibilityScorer:
+    """
+    Re-score edges by *necessity* and *indirect substitutability*.
+
+    Does NOT re-solve the inverse problem.  Takes the existing
+    score_matrix_unfiltered, lag_matrix, delta_mse_matrix and
+    target_summaries, then computes:
+
+      1) Necessity  N_ij  — how much validation error increases when
+         source i is dropped from target j's model.
+      2) Indirect support  I_ij  — strongest lag-consistent two-step
+         mediator path that could replace edge i→j.
+      3) Direct irreducibility  D_ij = N / (N + λI + ε)
+      4) Final direct score  S_dir = (α·raw_norm + (1-α)·nec_norm) · D
+    """
+
+    def __init__(
+        self,
+        alpha_raw: float = 0.35,
+        lambda_indirect: float = 1.0,
+        lag_tau: float = 1.0,
+        eps: float = 1e-12,
+    ):
+        self.alpha_raw = alpha_raw
+        self.lambda_indirect = lambda_indirect
+        self.lag_tau = lag_tau
+        self.eps = eps
+
+    def compute(
+        self,
+        score_matrix_unfiltered: np.ndarray,
+        lag_matrix: np.ndarray,
+        delta_mse_matrix: np.ndarray,
+        target_summaries: list,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return (necessity, indirect_support, irreducibility, direct_score)."""
+        raw = score_matrix_unfiltered.copy()
+        lag = lag_matrix.copy()
+        delta = np.maximum(delta_mse_matrix.copy(), 0.0)
+        n_dims = raw.shape[0]
+
+        # 1) Necessity
+        necessity = np.zeros_like(raw)
+        for target in range(n_dims):
+            s = target_summaries[target]
+            denom = max(self.eps, s.null_mse - s.baseline_mse)
+            necessity[:, target] = delta[:, target] / denom
+        necessity = np.maximum(necessity, 0.0)
+        np.fill_diagonal(necessity, 0.0)
+
+        # 2) Indirect support
+        indirect = np.zeros_like(raw)
+        for i in range(n_dims):
+            for j in range(n_dims):
+                if i == j:
+                    continue
+                best = 0.0
+                lij = lag[i, j]
+                for m in range(n_dims):
+                    if m == i or m == j:
+                        continue
+                    sim, smj = raw[i, m], raw[m, j]
+                    if sim <= 0.0 or smj <= 0.0:
+                        continue
+                    path_str = min(sim, smj)
+                    lag_gap = abs(lij - (lag[i, m] + lag[m, j]))
+                    support = path_str * np.exp(
+                        -lag_gap / max(self.lag_tau, self.eps)
+                    )
+                    if support > best:
+                        best = support
+                indirect[i, j] = best
+        np.fill_diagonal(indirect, 0.0)
+
+        # 3) Direct irreducibility
+        irreducibility = necessity / (
+            necessity + self.lambda_indirect * indirect + self.eps
+        )
+        irreducibility = np.clip(irreducibility, 0.0, 1.0)
+        np.fill_diagonal(irreducibility, 0.0)
+
+        # 4) Final direct score
+        raw_norm = self._normalize(raw)
+        nec_norm = self._normalize(necessity)
+        mixed = self.alpha_raw * raw_norm + (1.0 - self.alpha_raw) * nec_norm
+        direct_score = mixed * irreducibility
+        np.fill_diagonal(direct_score, 0.0)
+
+        return necessity, indirect, irreducibility, direct_score
+
+    @staticmethod
+    def _normalize(x: np.ndarray) -> np.ndarray:
+        x = np.maximum(np.asarray(x, dtype=float), 0.0)
+        xmax = x.max()
+        return x / xmax if xmax > 0 else np.zeros_like(x)
 
 
 # ============================================================================
@@ -259,6 +371,28 @@ class InverseCausalEngine:
 
         links.sort(key=lambda x: x.strength, reverse=True)
 
+        # --- Direct Irreducibility (post-solver layer) ---
+        nec_mat = ind_mat = irr_mat = dir_mat = None
+        if self.config.compute_direct_irreducibility:
+            scorer = DirectIrreducibilityScorer(
+                alpha_raw=self.config.di_alpha_raw,
+                lambda_indirect=self.config.di_lambda_indirect,
+                lag_tau=max(self.config.di_lag_tau, float(self.config.lag_tolerance)),
+                eps=self.config.eps,
+            )
+            nec_mat, ind_mat, irr_mat, dir_mat = scorer.compute(
+                score_matrix_unfiltered=score_unfiltered,
+                lag_matrix=lag,
+                delta_mse_matrix=delta_mse,
+                target_summaries=summaries,
+            )
+            logger.info(
+                f"   🎯 Direct Irreducibility: "
+                f"mean_D={irr_mat.mean():.4f}, "
+                f"max_D={irr_mat.max():.4f}, "
+                f"nonzero={np.count_nonzero(dir_mat)}"
+            )
+
         return InverseCausalResult(
             links=links,
             score_matrix=score,
@@ -273,6 +407,10 @@ class InverseCausalEngine:
             dimension_names=dimension_names,
             max_lag=self.config.max_lag,
             ar_lag=self.config.ar_lag,
+            necessity_matrix=nec_mat,
+            indirect_support_matrix=ind_mat,
+            direct_irreducibility_matrix=irr_mat,
+            direct_score_matrix=dir_mat,
         )
 
     def fit_predict(self, state_vectors: np.ndarray, dimension_names: Optional[list[str]] = None) -> np.ndarray:
