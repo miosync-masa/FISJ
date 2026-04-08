@@ -390,6 +390,9 @@ class FISJFusionAdapter:
         state_vectors = df.values.astype(np.float64)
 
         # Engine 1: NetworkAnalyzerCore (raw score + q-value source)
+        # adaptive=False: CauseMe provides max_lag, must not override.
+        # Fusion uses raw causal_matrix (pre-threshold), so adaptive
+        # threshold tuning has no effect anyway.
         nac = NetworkAnalyzerCore(
             max_lag=self.max_lag,
             adaptive=False,
@@ -409,6 +412,8 @@ class FISJFusionAdapter:
             include_intercept=True,
             validation_fraction=0.25,
             use_backward_check=True,
+            refit_on_drop=False,
+            residualize_ar=True,
             compute_direct_irreducibility=True,
         )
         ice_result = InverseCausalEngine(ice_config).fit(
