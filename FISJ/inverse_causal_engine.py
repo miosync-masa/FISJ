@@ -91,6 +91,9 @@ class InverseCausalEngineConfig:
     ar_lag: int = 1
     alpha_ridge: float = 1e-2
     alpha_smooth: float = 1e-2
+    solver: str = "lasso"  # "ridge", "lasso", "auto"
+    lasso_cv_folds: int = 5
+    lasso_max_iter: int = 5000
     adaptive_regularization: bool = True  # N/T依存の正則化
     standardize: bool = True
     include_intercept: bool = True
@@ -486,16 +489,31 @@ class InverseCausalEngine:
 
         lag_smoothness is applied independently to each block (self block and each source block)
         using a discrete first-difference penalty.
+
+        solver modes:
+          "ridge" : Ridge regression (L2, all coefficients shrink)
+          "lasso" : LassoCV (L1, automatic sparsity + cross-validated alpha)
+          "auto"  : Lasso if n_dims > 5, else Ridge
         """
         n_samples = X.shape[0]
         p = X.shape[1]
         if p == 0:
             return np.zeros(0, dtype=float)
 
-        # Adaptive regularization: scale with sqrt(log(p) / T)
+        # Determine solver
+        solver = self.config.solver
+        if solver == "auto":
+            n_dims = meta.get("n_dims", 3)
+            solver = "lasso" if n_dims > 5 else "ridge"
+
+        # --- Lasso path ---
+        if solver == "lasso":
+            return self._solve_lasso(X, y)
+
+        # --- Ridge path ---
         if self.config.adaptive_regularization and n_samples > 0 and p > 0:
             adaptive_scale = float(np.sqrt(np.log(max(p, 2)) / max(n_samples, 1)))
-            alpha_ridge = self.config.alpha_ridge * adaptive_scale / 0.1  # normalize so ~1x at p=46,T=300
+            alpha_ridge = self.config.alpha_ridge * adaptive_scale / 0.1
             alpha_smooth = self.config.alpha_smooth * adaptive_scale / 0.1
         else:
             alpha_ridge = self.config.alpha_ridge
@@ -523,6 +541,34 @@ class InverseCausalEngine:
         except np.linalg.LinAlgError:
             w = np.linalg.pinv(xtx + reg) @ xty
         return np.asarray(w, dtype=float)
+
+    def _solve_lasso(self, X: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """
+        Solve with LassoCV (L1 regularization with cross-validated alpha).
+
+        L1 naturally produces sparse solutions — noise sources get exactly
+        zero coefficients, while true causal sources retain non-zero weights.
+        """
+        from sklearn.linear_model import LassoCV
+
+        try:
+            lasso = LassoCV(
+                cv=self.config.lasso_cv_folds,
+                max_iter=self.config.lasso_max_iter,
+                n_jobs=-1,
+            ).fit(X, y)
+            return np.asarray(lasso.coef_, dtype=float)
+        except Exception:
+            # Fallback to Ridge if Lasso fails
+            p = X.shape[1]
+            xtx = X.T @ X
+            xty = X.T @ y
+            reg = self.config.alpha_ridge * np.eye(p)
+            try:
+                w = np.linalg.solve(xtx + reg, xty)
+            except np.linalg.LinAlgError:
+                w = np.linalg.pinv(xtx + reg) @ xty
+            return np.asarray(w, dtype=float)
 
     def _drop_source_and_score(
         self,
@@ -567,9 +613,11 @@ class InverseCausalEngine:
         Build the final continuous score matrix.
 
         score_mode controls the composition:
-          "block_norm" : block norm only (simplest, best for AUC ranking)
+          "block_norm" : block norm only (simplest)
           "delta_mse"  : delta MSE only (prediction importance)
           "mixed"      : weighted combination of all components
+          "anomaly"    : block_norm with anomaly detection
+                         (noise suppression + signal boost)
         """
         mode = self.config.score_mode
 
@@ -579,6 +627,9 @@ class InverseCausalEngine:
         if mode == "delta_mse":
             return self._normalize_positive(np.maximum(delta_mse, 0.0))
 
+        if mode == "anomaly":
+            return self._anomaly_score(block_norm)
+
         # mixed (default fallback)
         bn = self._normalize_positive(block_norm)
         dm = self._normalize_positive(np.maximum(delta_mse, 0.0))
@@ -587,6 +638,74 @@ class InverseCausalEngine:
         delta_part = (1.0 - self.config.confidence_mix) * dm + self.config.confidence_mix * cf
         score = self.config.score_mix * bn + (1.0 - self.config.score_mix) * delta_part
         return np.asarray(score, dtype=float)
+
+    @staticmethod
+    def _anomaly_score(block_norm: np.ndarray) -> np.ndarray:
+        """
+        Anomaly-based scoring: treat each target's incoming block_norms
+        as a distribution, and identify signal (outliers) vs noise.
+
+        For each target column j:
+          - compute median and MAD of incoming block_norms
+          - z_robust = (bn - median) / MAD
+          - signal: z > 2 → boost (keep original + extra)
+          - noise:  z < 1 → suppress (shrink toward zero)
+          - border: linear interpolation
+
+        This naturally adapts to the number of dimensions:
+          N=3:  2 sources → outlier is obvious
+          N=10: 9 sources → noise floor is well-estimated
+
+        Result is re-normalized to [0, 1].
+        """
+        n_dims = block_norm.shape[0]
+        score = np.zeros_like(block_norm)
+
+        for target in range(n_dims):
+            # Incoming block_norms for this target
+            col = block_norm[:, target].copy()
+            col[target] = 0.0  # self is always zero
+
+            # Get non-zero values (sources only)
+            sources = [i for i in range(n_dims) if i != target]
+            vals = col[sources]
+
+            if len(vals) < 2 or np.max(vals) < 1e-10:
+                continue
+
+            # Robust statistics
+            med = float(np.median(vals))
+            mad = float(np.median(np.abs(vals - med)))
+            if mad < 1e-10:
+                mad = float(np.std(vals)) * 0.6745  # fallback
+            if mad < 1e-10:
+                # All values nearly identical → no signal
+                continue
+
+            for src in sources:
+                bn = col[src]
+                z = (bn - med) / mad
+
+                if z > 3.0:
+                    # Strong signal → boost
+                    score[src, target] = bn * (1.0 + z * 0.5)
+                elif z > 1.5:
+                    # Moderate signal → keep with mild boost
+                    blend = (z - 1.5) / 1.5  # 0→1
+                    score[src, target] = bn * (1.0 + blend * z * 0.3)
+                elif z > 0.5:
+                    # Border → keep but no boost
+                    score[src, target] = bn * 0.5
+                else:
+                    # Noise → suppress
+                    score[src, target] = bn * 0.1
+
+        # Normalize to [0, 1]
+        smax = np.max(score)
+        if smax > 0:
+            score = score / smax
+
+        return score
 
     # ---------------------------------------------------------------------
     # Link extraction / pruning / textbook filters
