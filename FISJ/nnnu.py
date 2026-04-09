@@ -1,6 +1,28 @@
 """
 NNNU — Neural Network Non-Use (v5)
 ====================================
+Built by Masamichi & Tamaki
+
+Zero-parameter, zero-regression, zero-learning causal discovery.
+Λ³ core inherited from BANKAI-MD / GETTER One lineage.
+
+v5: GETTER One component integration
+  - _calculate_local_std_1d / _calculate_rho_t_1d (Λ³ native)
+  - _extract_lambda3_events (ΔΛC event extraction)
+  - _compute_adaptive_parameters (data-driven auto-tuning)
+  - _conditional_propagation (±2 frame window spurious filter)
+
+Architecture:
+  1. Λ³ event extraction (adaptive percentile + window)
+  2. signed_mean at each lag: mean(target_displacement × source_sign)
+     → Jumps determine WHEN to look
+     → signed_mean determines WHAT is seen
+  3. Common ancestor filter (conditional propagation probability)
+  4. Mediator filter (lag consistency)
+  5. Conditional scoring (causal-path-aware frame exclusion)
+  6. BH-FDR correction
+  7. Suppress scoring (filter + BH-FDR → score discount for AUC)
+
 "人間が因果ですって言ってるのは、相関性が何回か確認できました。以上。"
 """
 
@@ -251,7 +273,8 @@ class NNNUEngine:
 
         # --- Step 7: Suppress scoring (filter + BH-FDR + consistency → score discount) ---
         suppress_floor = 0.05
-        min_consistency = 0.65  # Below this: directionally inconsistent → suppress
+        # Adaptive consistency threshold: stricter for small N (less BH correction)
+        min_consistency = 0.70 if n_dims <= 5 else 0.65
         out_score = score_matrix.copy()
         for i in range(n_dims):
             for j in range(n_dims):
@@ -261,7 +284,7 @@ class NNNUEngine:
                     out_score[i, j] *= suppress_floor
                 if q_matrix[i, j] >= self.alpha:
                     out_score[i, j] *= suppress_floor
-                if consistency_matrix[i, j] < min_consistency:
+                if consistency_matrix[i, j] <= min_consistency:
                     out_score[i, j] *= suppress_floor
 
         # --- Step 8: Binary adjacency ---
@@ -272,7 +295,7 @@ class NNNUEngine:
                     continue
                 if (q_matrix[i, j] < self.alpha
                         and filtered_score[i, j] > 0
-                        and consistency_matrix[i, j] >= min_consistency):
+                        and consistency_matrix[i, j] > min_consistency):
                     binary_matrix[i, j] = 1.0
 
         total_jumps = int(np.sum(jump_counts))
@@ -703,31 +726,40 @@ class NNNUEngine:
 
     @staticmethod
     def _bh_fdr(p_matrix: np.ndarray, n_dims: int) -> np.ndarray:
-        """Benjamini-Hochberg FDR correction."""
-        pairs = []
-        for i in range(n_dims):
-            for j in range(n_dims):
-                if i != j:
-                    pairs.append((i, j, p_matrix[i, j]))
+        """
+        Per-source Benjamini-Hochberg FDR correction.
 
-        if not pairs:
-            return np.ones_like(p_matrix)
-
-        raw = np.array([p for _, _, p in pairs], dtype=float)
-        order = np.argsort(raw)
-        sorted_p = raw[order]
-        m = len(sorted_p)
-
-        adjusted = np.zeros(m, dtype=float)
-        adjusted[-1] = sorted_p[-1]
-        for k in range(m - 2, -1, -1):
-            adjusted[k] = min(adjusted[k + 1], sorted_p[k] * m / (k + 1))
-        adjusted = np.clip(adjusted, 0.0, 1.0)
-
+        Each source's jumps are independent experiments.
+        Correct N-1 tests per source, not N*(N-1) globally.
+        This prevents over-correction in high-dimensional data.
+        """
         q = np.ones_like(p_matrix)
-        for rank, idx in enumerate(order):
-            i, j, _ = pairs[idx]
-            q[i, j] = adjusted[rank]
+
+        for src in range(n_dims):
+            # Collect targets for this source
+            targets = []
+            for tgt in range(n_dims):
+                if src != tgt:
+                    targets.append((tgt, p_matrix[src, tgt]))
+
+            if not targets:
+                continue
+
+            raw = np.array([p for _, p in targets], dtype=float)
+            order = np.argsort(raw)
+            sorted_p = raw[order]
+            m = len(sorted_p)
+
+            adjusted = np.zeros(m, dtype=float)
+            adjusted[-1] = sorted_p[-1]
+            for k in range(m - 2, -1, -1):
+                adjusted[k] = min(adjusted[k + 1], sorted_p[k] * m / (k + 1))
+            adjusted = np.clip(adjusted, 0.0, 1.0)
+
+            for rank, idx in enumerate(order):
+                tgt, _ = targets[idx]
+                q[src, tgt] = adjusted[rank]
+
         np.fill_diagonal(q, 1.0)
         return q
 
