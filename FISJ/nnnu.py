@@ -271,8 +271,9 @@ class NNNUEngine:
         # --- Step 6.5: BH-FDR correction ---
         q_matrix = self._bh_fdr(cond_p, n_dims)
 
-        # --- Step 7: Suppress scoring (filter + BH-FDR → score discount) ---
+        # --- Step 7: Suppress scoring (filter + BH-FDR + consistency → score discount) ---
         suppress_floor = 0.05
+        min_consistency = 0.65  # Below this: directionally inconsistent → suppress
         out_score = score_matrix.copy()
         for i in range(n_dims):
             for j in range(n_dims):
@@ -282,6 +283,8 @@ class NNNUEngine:
                     out_score[i, j] *= suppress_floor
                 if q_matrix[i, j] >= self.alpha:
                     out_score[i, j] *= suppress_floor
+                if consistency_matrix[i, j] < min_consistency:
+                    out_score[i, j] *= suppress_floor
 
         # --- Step 8: Binary adjacency ---
         binary_matrix = np.zeros((n_dims, n_dims))
@@ -289,7 +292,9 @@ class NNNUEngine:
             for j in range(n_dims):
                 if i == j:
                     continue
-                if q_matrix[i, j] < self.alpha and filtered_score[i, j] > 0:
+                if (q_matrix[i, j] < self.alpha
+                        and filtered_score[i, j] > 0
+                        and consistency_matrix[i, j] >= min_consistency):
                     binary_matrix[i, j] = 1.0
 
         total_jumps = int(np.sum(jump_counts))
@@ -548,19 +553,29 @@ class NNNUEngine:
                         continue
 
                     mediated = int(lag_matrix[a, m]) + int(lag_matrix[m, b])
-                    if abs(mediated - lag_ab) > max(2, lag_ab // 2):
-                        continue
+                    lag_diff = abs(mediated - lag_ab)
 
-                    prob_with, prob_without = self._conditional_propagation(
-                        events_all, a, b, m, lag_ab,
-                    )
+                    # Strict lag match: pure structural evidence
+                    if lag_diff <= 1:
+                        path_str = min(score_matrix[a, m], score_matrix[m, b])
+                        # Path must be strictly stronger than direct edge
+                        if path_str >= score_matrix[a, b]:
+                            out_score[a, b] = 0.0
+                            out_lag[a, b] = 0
+                            out_sign[a, b] = 0.0
+                            break
 
-                    if (prob_without < score_matrix[a, b] * 0.4
-                            and prob_with > prob_without * 2.0):
-                        out_score[a, b] = 0.0
-                        out_lag[a, b] = 0
-                        out_sign[a, b] = 0.0
-                        break
+                    # Loose lag match: needs probability confirmation
+                    if lag_diff <= max(2, lag_ab // 2):
+                        prob_with, prob_without = self._conditional_propagation(
+                            events_all, a, b, m, lag_ab,
+                        )
+                        if (prob_without < score_matrix[a, b] * 0.4
+                                and prob_with > prob_without * 2.0):
+                            out_score[a, b] = 0.0
+                            out_lag[a, b] = 0
+                            out_sign[a, b] = 0.0
+                            break
 
         return out_score, out_lag, out_sign
 
