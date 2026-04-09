@@ -1,5 +1,5 @@
 from .main import NetworkAnalyzerCore, NetworkResult, DimensionLink, CooperativeEventNetwork
-from .adapter import FISJAdapter, FISJInverseAdapter, FISJFusionAdapter, MethodOutput
+from .adapter import FISJAdapter, FISJInverseAdapter, FISJFusionAdapter, FISJTripleFusionAdapter, MethodOutput
 from .network_analyzer_core_v2 import (
     NetworkAnalyzerCoreV2,
     GenericRegimeConfig,
@@ -35,6 +35,7 @@ __all__ = [
     "FISJAdapter",
     "FISJInverseAdapter",
     "FISJFusionAdapter",
+    "FISJTripleFusionAdapter",
     "MethodOutput",
     "NetworkAnalyzerCoreV2",
     "GenericRegimeConfig",
