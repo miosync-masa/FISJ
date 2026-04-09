@@ -83,6 +83,7 @@ class NNNUResult:
     q_matrix: np.ndarray
     jump_counts: np.ndarray
     raw_score_matrix: np.ndarray
+    consistency_matrix: np.ndarray | None = None
     rho_t: np.ndarray | None = None
     adaptive_params: dict | None = None
     n_dims: int = 0
@@ -182,11 +183,12 @@ class NNNUEngine:
             jump_signs[d] = all_signs[order]
             jump_counts[d] = len(all_frames)
 
-        # --- Step 3: signed_mean scoring ---
+        # --- Step 3: signed_mean × directional consistency scoring ---
         score_matrix = np.zeros((n_dims, n_dims))
         lag_matrix = np.zeros((n_dims, n_dims), dtype=int)
         sign_matrix = np.zeros((n_dims, n_dims))
         p_matrix = np.ones((n_dims, n_dims))
+        consistency_matrix = np.zeros((n_dims, n_dims))
 
         for src in range(n_dims):
             frames = jump_frames[src]
@@ -203,6 +205,7 @@ class NNNUEngine:
                 best_lag = 0
                 best_sign = 0.0
                 best_pval = 1.0
+                best_consistency = 0.5
 
                 for lag in range(1, self.max_lag + 1):
                     valid = frames + lag < n_disp
@@ -214,6 +217,16 @@ class NNNUEngine:
                     responses = disp[v_frames + lag, tgt]
                     signed_resp = responses * v_signs
                     signed_mean = np.mean(signed_resp)
+
+                    # Directional consistency: how consistently same direction?
+                    same_sign_rate = np.mean(signed_resp > 0)
+                    # Adjusted: works for both positive and negative causation
+                    consistency = max(same_sign_rate, 1 - same_sign_rate)
+                    # Bonus: 0.5 → 0.0, 0.7 → 0.4, 0.9 → 0.8, 1.0 → 1.0
+                    consistency_bonus = (consistency - 0.5) * 2.0
+
+                    # Combined score: magnitude × directional consistency
+                    combined = abs(signed_mean) * (1.0 + consistency_bonus)
 
                     # t-test
                     n = len(signed_resp)
@@ -228,16 +241,18 @@ class NNNUEngine:
                     else:
                         pval = 1.0
 
-                    if abs(signed_mean) > abs(best_score):
-                        best_score = signed_mean
+                    if combined > best_score:
+                        best_score = combined
                         best_lag = lag
                         best_sign = 1.0 if signed_mean > 0 else -1.0
                         best_pval = pval
+                        best_consistency = consistency
 
-                score_matrix[src, tgt] = abs(best_score)
+                score_matrix[src, tgt] = best_score
                 lag_matrix[src, tgt] = best_lag
                 sign_matrix[src, tgt] = best_sign
                 p_matrix[src, tgt] = best_pval
+                consistency_matrix[src, tgt] = best_consistency
 
         raw_score_matrix = score_matrix.copy()
 
@@ -293,6 +308,7 @@ class NNNUEngine:
             q_matrix=q_matrix,
             jump_counts=jump_counts,
             raw_score_matrix=raw_score_matrix,
+            consistency_matrix=consistency_matrix,
             rho_t=rho_t,
             adaptive_params=adaptive_params,
             n_dims=n_dims,
