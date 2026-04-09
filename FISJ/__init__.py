@@ -21,6 +21,11 @@ from .score_fusion import (
     FusionResult,
     compute_causal_q_matrix,
 )
+from .nnnu import (
+    NNNUEngine,
+    NNNUResult,
+    NNNUAdapter,
+)
 
 __all__ = [
     "NetworkAnalyzerCore",
@@ -46,4 +51,7 @@ __all__ = [
     "fuse_scores",
     "FusionResult",
     "compute_causal_q_matrix",
+    "NNNUEngine",
+    "NNNUResult",
+    "NNNUAdapter",
 ]
