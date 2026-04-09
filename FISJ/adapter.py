@@ -484,14 +484,14 @@ class FISJTripleFusionAdapter:
         solver: str = "auto",
         alpha: float = 0.05,
         suppress_floor: float = 0.05,
-        jump_percentile: float = 94.0,
+        delta_percentile: float = 90.0,
         method_name: str | None = None,
     ):
         self.max_lag = max_lag
         self.solver = solver
         self.alpha = alpha
         self.suppress_floor = suppress_floor
-        self.jump_percentile = jump_percentile
+        self.delta_percentile = delta_percentile
         if method_name is not None:
             self.method_name = method_name
 
@@ -537,7 +537,7 @@ class FISJTripleFusionAdapter:
         # Engine 3: NNNU (signed_mean + BH-FDR)
         nnnu = NNNUEngine(
             max_lag=self.max_lag,
-            jump_percentile=self.jump_percentile,
+            delta_percentile=self.delta_percentile,
             alpha=self.alpha,
         )
         nnnu_result = nnnu.fit(state_vectors)
