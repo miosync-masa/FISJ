@@ -224,6 +224,9 @@ def fuse_scores(
     max_lag: int,
     # --- From V2 Regime-Aware (optional) ---
     frequency_matrix: np.ndarray | None = None,
+    # --- From NNNU (optional) ---
+    nnnu_score_matrix: np.ndarray | None = None,
+    nnnu_q_matrix: np.ndarray | None = None,
     # --- Fusion parameters ---
     fusion_mode: str = "suppress",
     w_raw: float = 0.50,
@@ -243,8 +246,9 @@ def fuse_scores(
     "suppress" (default):
         Uses q-value as a hard suppressor to kill non-significant edges.
         Best for AUC — preserves clean separation between true/false.
-            S = raw * DI_gate * suppressor
+            S = raw * DI_gate * suppressor * nnnu_gate
             suppressor = 1.0 if q < alpha, else suppress_floor
+            nnnu_gate  = 1.0 if nnnu confirms, else suppress_floor
 
     "geometric":
         Rank-normalized geometric mean. All evidence treated equally.
@@ -302,6 +306,24 @@ def fuse_scores(
         # Blend: raw base + DI boost, then suppress
         di_gate = 0.7 + 0.3 * struct_norm
         fused = raw_norm * di_gate * suppressor
+
+        # NNNU gate: if NNNU sees no causal signal, suppress further
+        if nnnu_score_matrix is not None:
+            nnnu_norm = np.maximum(nnnu_score_matrix, 0.0)
+            nnnu_max = nnnu_norm.max()
+            if nnnu_max > 0:
+                nnnu_norm = nnnu_norm / nnnu_max
+            # Soft gate: NNNU score scales 0.3 → 1.0
+            # Even 0 NNNU score gives 0.3 (doesn't completely kill)
+            nnnu_gate = 0.3 + 0.7 * nnnu_norm
+            fused = fused * nnnu_gate
+
+        # NNNU q-value as hard suppressor (if available)
+        if nnnu_q_matrix is not None:
+            nnnu_suppress = np.where(nnnu_q_matrix < alpha, 1.0, suppress_floor)
+            np.fill_diagonal(nnnu_suppress, 0.0)
+            fused = fused * nnnu_suppress
+
         np.fill_diagonal(fused, 0.0)
 
     else:  # "geometric"
