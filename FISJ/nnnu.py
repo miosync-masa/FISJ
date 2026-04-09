@@ -1,28 +1,6 @@
 """
 NNNU — Neural Network Non-Use (v5)
 ====================================
-Built by Masamichi & Tamaki
-
-Zero-parameter, zero-regression, zero-learning causal discovery.
-Λ³ core inherited from BANKAI-MD / GETTER One lineage.
-
-v5: GETTER One component integration
-  - _calculate_local_std_1d / _calculate_rho_t_1d (Λ³ native)
-  - _extract_lambda3_events (ΔΛC event extraction)
-  - _compute_adaptive_parameters (data-driven auto-tuning)
-  - _conditional_propagation (±2 frame window spurious filter)
-
-Architecture:
-  1. Λ³ event extraction (adaptive percentile + window)
-  2. signed_mean at each lag: mean(target_displacement × source_sign)
-     → Jumps determine WHEN to look
-     → signed_mean determines WHAT is seen
-  3. Common ancestor filter (conditional propagation probability)
-  4. Mediator filter (lag consistency)
-  5. Conditional scoring (causal-path-aware frame exclusion)
-  6. BH-FDR correction
-  7. Suppress scoring (filter + BH-FDR → score discount for AUC)
-
 "人間が因果ですって言ってるのは、相関性が何回か確認できました。以上。"
 """
 
