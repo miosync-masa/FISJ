@@ -395,7 +395,7 @@ class FISJFusionAdapter:
         # threshold tuning has no effect anyway.
         nac = NetworkAnalyzerCore(
             max_lag=self.max_lag,
-            adaptive=True,
+            adaptive=False,
             p_value_threshold=self.alpha,
         )
         nac_result = nac.analyze(
@@ -458,5 +458,128 @@ class FISJFusionAdapter:
                 "n_sig_edges": int(np.sum(fusion.q_matrix < self.alpha)),
                 "n_binary_edges": int(np.sum(adjacency)),
                 "has_di": ice_result.direct_score_matrix is not None,
+            },
+        )
+
+
+class FISJTripleFusionAdapter:
+    """
+    3-Engine Fusion: main.py × inverse × NNNU.
+
+    Five-layer kill chain:
+      Layer 1: Λ³ displacement     → scale false killed
+      Layer 2: Precision matrix    → indirect false killed
+      Layer 3: DI source drop      → structural false killed
+      Layer 4: q-value suppress    → statistical false killed
+      Layer 5: NNNU signed_mean    → jump-unconfirmed false killed
+
+    "残ったものだけが真の因果"
+    """
+
+    method_name = "FISJ-Triple"
+
+    def __init__(
+        self,
+        max_lag: int = 5,
+        solver: str = "auto",
+        alpha: float = 0.05,
+        suppress_floor: float = 0.05,
+        jump_percentile: float = 94.0,
+        method_name: str | None = None,
+    ):
+        self.max_lag = max_lag
+        self.solver = solver
+        self.alpha = alpha
+        self.suppress_floor = suppress_floor
+        self.jump_percentile = jump_percentile
+        if method_name is not None:
+            self.method_name = method_name
+
+    def fit(
+        self,
+        df: pd.DataFrame,
+        cfg: object | None = None,
+    ) -> MethodOutput:
+        from .nnnu import NNNUEngine
+
+        names = list(df.columns)
+        n = len(names)
+        state_vectors = df.values.astype(np.float64)
+
+        # Engine 1: NetworkAnalyzerCore (raw score + q-value)
+        nac = NetworkAnalyzerCore(
+            max_lag=self.max_lag,
+            adaptive=False,
+            p_value_threshold=self.alpha,
+        )
+        nac_result = nac.analyze(
+            state_vectors=state_vectors,
+            dimension_names=names,
+        )
+
+        # Engine 2: InverseCausalEngine (DI)
+        ice_config = InverseCausalEngineConfig(
+            max_lag=self.max_lag,
+            ar_lag=1,
+            solver=self.solver,
+            standardize=True,
+            include_intercept=True,
+            validation_fraction=0.25,
+            use_backward_check=True,
+            refit_on_drop=False,
+            residualize_ar=True,
+            compute_direct_irreducibility=True,
+        )
+        ice_result = InverseCausalEngine(ice_config).fit(
+            state_vectors, dimension_names=names,
+        )
+
+        # Engine 3: NNNU (signed_mean + BH-FDR)
+        nnnu = NNNUEngine(
+            max_lag=self.max_lag,
+            jump_percentile=self.jump_percentile,
+            alpha=self.alpha,
+        )
+        nnnu_result = nnnu.fit(state_vectors)
+
+        # 3-Engine Fusion (suppress mode)
+        n_samples = state_vectors.shape[0] - self.max_lag
+        raw_score = np.abs(nac_result.causal_matrix)
+        np.fill_diagonal(raw_score, 0.0)
+
+        fusion = fuse_scores(
+            raw_score_matrix=raw_score,
+            direct_score_matrix=ice_result.direct_score_matrix,
+            causal_matrix=nac_result.causal_matrix,
+            lag_matrix=nac_result.causal_lag_matrix,
+            n_samples=n_samples,
+            max_lag=self.max_lag,
+            nnnu_score_matrix=nnnu_result.score_matrix,
+            nnnu_q_matrix=nnnu_result.q_matrix,
+            fusion_mode="suppress",
+            alpha=self.alpha,
+            suppress_floor=self.suppress_floor,
+        )
+
+        scores = fusion.fused_score_matrix.copy()
+        adjacency = fusion.binary_matrix.astype(int)
+
+        return MethodOutput(
+            method_name=self.method_name,
+            names=names,
+            adjacency_scores=scores,
+            adjacency_bin=adjacency,
+            directed_support=True,
+            lag_support=True,
+            sign_support=True,
+            lag_matrix=ice_result.lag_matrix,
+            sign_matrix=ice_result.sign_matrix,
+            meta={
+                "fusion_mode": "triple_suppress",
+                "alpha": self.alpha,
+                "q_matrix": fusion.q_matrix,
+                "nnnu_q_matrix": nnnu_result.q_matrix,
+                "nnnu_score_matrix": nnnu_result.score_matrix,
+                "n_binary_edges": int(np.sum(adjacency)),
             },
         )
