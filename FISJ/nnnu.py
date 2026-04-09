@@ -183,19 +183,20 @@ class NNNUEngine:
             jump_signs[d] = all_signs[order]
             jump_counts[d] = len(all_frames)
 
-        # --- Step 3: signed_mean × directional consistency scoring ---
+        # --- Step 3: ALL-frame signed_mean × jump-based consistency ---
+        # Score: ALL frames (statistical power, n=T)
+        # Consistency: JUMP frames only (signal quality, not diluted by noise)
         score_matrix = np.zeros((n_dims, n_dims))
         lag_matrix = np.zeros((n_dims, n_dims), dtype=int)
         sign_matrix = np.zeros((n_dims, n_dims))
         p_matrix = np.ones((n_dims, n_dims))
         consistency_matrix = np.zeros((n_dims, n_dims))
 
+        from scipy.stats import t as t_dist
+
         for src in range(n_dims):
             frames = jump_frames[src]
             signs = jump_signs[src]
-            n_jumps = len(frames)
-            if n_jumps < self.min_jumps:
-                continue
 
             for tgt in range(n_dims):
                 if src == tgt:
@@ -208,38 +209,42 @@ class NNNUEngine:
                 best_consistency = 0.5
 
                 for lag in range(1, self.max_lag + 1):
-                    valid = frames + lag < n_disp
-                    if np.sum(valid) < self.min_jumps:
+                    if lag >= n_disp:
                         continue
 
-                    v_frames = frames[valid]
-                    v_signs = signs[valid]
-                    responses = disp[v_frames + lag, tgt]
-                    signed_resp = responses * v_signs
-                    signed_mean = np.mean(signed_resp)
+                    # ALL frames: scoring + t-test
+                    src_disp = disp[:-lag, src]
+                    tgt_disp = disp[lag:, tgt]
+                    src_signs = np.sign(src_disp)
+                    signed_resp_all = tgt_disp * src_signs
+                    signed_mean = np.mean(signed_resp_all)
 
-                    # Directional consistency: how consistently same direction?
-                    same_sign_rate = np.mean(signed_resp > 0)
-                    # Adjusted: works for both positive and negative causation
-                    consistency = max(same_sign_rate, 1 - same_sign_rate)
-                    # Bonus: 0.5 → 0.0, 0.7 → 0.4, 0.9 → 0.8, 1.0 → 1.0
-                    consistency_bonus = (consistency - 0.5) * 2.0
-
-                    # Combined score: magnitude × directional consistency
-                    combined = abs(signed_mean) * (1.0 + consistency_bonus)
-
-                    # t-test
-                    n = len(signed_resp)
+                    # t-test on ALL frames (df ≈ T, very powerful)
+                    n = len(signed_resp_all)
                     if n > 2:
-                        std = np.std(signed_resp, ddof=1)
+                        std = np.std(signed_resp_all, ddof=1)
                         if std > 1e-12:
                             t_stat = signed_mean / (std / np.sqrt(n))
-                            from scipy.stats import t as t_dist
                             pval = float(2.0 * t_dist.sf(abs(t_stat), n - 1))
                         else:
                             pval = 0.0 if abs(signed_mean) > 0 else 1.0
                     else:
                         pval = 1.0
+
+                    # JUMP frames: directional consistency (not diluted)
+                    consistency = 0.5
+                    if len(frames) >= self.min_jumps:
+                        valid_j = frames + lag < n_disp
+                        if np.sum(valid_j) >= self.min_jumps:
+                            j_frames = frames[valid_j]
+                            j_signs = signs[valid_j]
+                            j_resp = disp[j_frames + lag, tgt]
+                            j_signed = j_resp * j_signs
+                            same_sign_rate = np.mean(j_signed > 0)
+                            consistency = max(same_sign_rate, 1 - same_sign_rate)
+
+                    consistency_bonus = (consistency - 0.5) * 2.0
+                    combined = abs(signed_mean) * (1.0 + consistency_bonus)
 
                     if combined > best_score:
                         best_score = combined
