@@ -231,27 +231,42 @@ class NNNUEngine:
 
         raw_score_matrix = score_matrix.copy()
 
-        # --- Step 4 & 5: Spurious filter (common ancestor + mediator) ---
-        score_matrix, lag_matrix, sign_matrix = self._spurious_filter(
-            score_matrix, lag_matrix, sign_matrix, n_dims,
+        # --- Step 4 & 5: Spurious filter ---
+        filtered_score, filtered_lag, filtered_sign = self._spurious_filter(
+            score_matrix.copy(), lag_matrix.copy(), sign_matrix.copy(), n_dims,
         )
 
-        # --- Step 6: Conditional signed_mean (multi-dim interaction) ---
-        score_matrix, p_matrix = self._conditional_scoring(
-            score_matrix, lag_matrix, p_matrix,
+        # --- Step 6: Conditional signed_mean (p-value update) ---
+        _, cond_p = self._conditional_scoring(
+            filtered_score, filtered_lag, p_matrix.copy(),
             disp, jump_frames, jump_signs, n_dims, n_disp,
         )
 
         # --- Step 6.5: BH-FDR correction ---
-        q_matrix = self._bh_fdr(p_matrix, n_dims)
+        q_matrix = self._bh_fdr(cond_p, n_dims)
 
-        # --- Step 7: Binary adjacency (using q-values) ---
+        # --- Step 7: Score suppress (filter + BH-FDR → score discount) ---
+        # Keep raw scores but suppress filtered/non-significant edges
+        suppress_floor = 0.05
+        out_score = score_matrix.copy()
+        for i in range(n_dims):
+            for j in range(n_dims):
+                if i == j:
+                    continue
+                # Spurious filter killed it → suppress
+                if filtered_score[i, j] == 0 and score_matrix[i, j] > 0:
+                    out_score[i, j] *= suppress_floor
+                # BH-FDR not significant → suppress
+                if q_matrix[i, j] >= self.alpha:
+                    out_score[i, j] *= suppress_floor
+
+        # --- Step 8: Binary (q-value + spurious filter) ---
         binary_matrix = np.zeros((n_dims, n_dims))
         for i in range(n_dims):
             for j in range(n_dims):
                 if i == j:
                     continue
-                if q_matrix[i, j] < self.alpha and score_matrix[i, j] > 0:
+                if q_matrix[i, j] < self.alpha and filtered_score[i, j] > 0:
                     binary_matrix[i, j] = 1.0
 
         total_jumps = int(np.sum(jump_counts))
@@ -261,12 +276,14 @@ class NNNUEngine:
             f"{int(np.sum(binary_matrix))} edges"
         )
 
+        # out_score = signed_mean × suppress (filter/BH-FDR → AUC ranking)
+        # binary_matrix = hard decision (q-value + spurious → F-measure)
         return NNNUResult(
-            score_matrix=score_matrix,
+            score_matrix=out_score,
             binary_matrix=binary_matrix,
             lag_matrix=lag_matrix,
             sign_matrix=sign_matrix.astype(int),
-            p_matrix=p_matrix,
+            p_matrix=cond_p,
             q_matrix=q_matrix,
             jump_counts=jump_counts,
             raw_score_matrix=raw_score_matrix,
