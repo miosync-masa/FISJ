@@ -26,6 +26,7 @@ from .nnnu import (
     NNNUResult,
     NNNUAdapter,
 )
+from .nnnu_inverse import NNNUInverseAdapter
 
 __all__ = [
     "NetworkAnalyzerCore",
@@ -55,4 +56,5 @@ __all__ = [
     "NNNUEngine",
     "NNNUResult",
     "NNNUAdapter",
+    "NNNUInverseAdapter",
 ]
