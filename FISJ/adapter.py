@@ -15,6 +15,13 @@ Methods:
     - 'nnnu_inverse': NNNU + Inverse + Regime rescue (recommended)
     - 'fusion':       NetworkCore + Inverse (legacy, AUC-strongest)
     - 'inverse':      Inverse only
+
+Lag matrix convention (unified across all methods):
+    lag_matrix[i, j] = k >= 0   ← directed edge i→j with time delay k
+    lag_matrix[i, j] = 0        ← no edge from i to j
+
+    NetworkAnalyzerCore natively uses anti-symmetric (signed lag) format;
+    this adapter normalizes it to the unified positive-only convention.
 """
 
 from __future__ import annotations
@@ -60,7 +67,7 @@ class FISJAdapter:
     method : str
         One of 'nnnu', 'nnnu_inverse', 'fusion', 'inverse'.
     max_lag : int
-        Maximum causal lag.
+        Maximum causal lag. Strictly enforced (adaptive=False for fairness).
     solver : str
         Inverse engine solver ('ridge', 'lasso', 'auto').
     alpha : float
@@ -71,6 +78,12 @@ class FISJAdapter:
         Score discount factor for filtered edges.
     regime_aware : bool
         Enable regime rescue (nnnu_inverse only).
+    network_adaptive : bool
+        If True, NetworkAnalyzerCore auto-adjusts max_lag.
+        Default False for benchmark fairness (max_lag strictly enforced).
+    nnnu_adaptive : bool
+        If True, NNNU auto-tunes its internal parameters (percentile, windows).
+        Default True — this is internal tuning, doesn't violate max_lag.
     """
 
     SUPPORTED_METHODS = ("nnnu", "nnnu_inverse", "fusion", "inverse")
@@ -86,6 +99,8 @@ class FISJAdapter:
         regime_aware: bool = True,
         n_regimes: int = 3,
         min_segment_length: int = 40,
+        network_adaptive: bool = False,
+        nnnu_adaptive: bool = True,
         method_name: str | None = None,
     ):
         if method not in self.SUPPORTED_METHODS:
@@ -102,6 +117,8 @@ class FISJAdapter:
         self.regime_aware = regime_aware
         self.n_regimes = n_regimes
         self.min_segment_length = min_segment_length
+        self.network_adaptive = network_adaptive
+        self.nnnu_adaptive = nnnu_adaptive
         self.method_name = method_name or method.upper()
 
     def fit(self, df: pd.DataFrame, cfg=None) -> MethodOutput:
@@ -126,7 +143,7 @@ class FISJAdapter:
             max_lag=self.max_lag,
             delta_percentile=self.delta_percentile,
             alpha=self.alpha,
-            adaptive=True,
+            adaptive=self.nnnu_adaptive,
         )
         r = engine.fit(data)
 
@@ -159,7 +176,7 @@ class FISJAdapter:
             max_lag=self.max_lag,
             delta_percentile=self.delta_percentile,
             alpha=self.alpha,
-            adaptive=True,
+            adaptive=self.nnnu_adaptive,
         )
         nnnu_r = engine.fit(data)
 
@@ -209,13 +226,19 @@ class FISJAdapter:
     # ==================================================================
     # Method: Fusion (NetworkCore + Inverse) — legacy
     # ==================================================================
+    # Normalizes NetworkAnalyzerCore's signed-lag matrix to the unified
+    # positive-only lag convention, ensuring consistency with NNNU output.
 
     def _run_fusion(self, df):
         names = list(df.columns)
+        n = len(names)
         data = df.values.astype(np.float64)
 
-        # NetworkCore (legacy partial correlation)
-        network = NetworkAnalyzerCore(max_lag=self.max_lag, adaptive=True)
+        # NetworkCore — adaptive=False by default to strictly enforce max_lag
+        network = NetworkAnalyzerCore(
+            max_lag=self.max_lag,
+            adaptive=self.network_adaptive,
+        )
         net_r = network.analyze(data, dimension_names=names)
 
         # Inverse
@@ -228,20 +251,41 @@ class FISJAdapter:
         )
         ice_r = InverseCausalEngine(ice_config).fit(data, dimension_names=names)
 
-        # Fusion: NetworkCore score × Inverse DI gate
-        n = len(names)
-        net_score = np.maximum(np.abs(net_r.sync_matrix), np.abs(net_r.causal_matrix))
-        scores = self._apply_di_gate(net_score, ice_r.direct_score_matrix, n)
-
-        # Binary from NetworkCore links
+        # ============================================================
+        # Reconstruct direction-aware matrices from causal_network.
+        # NetworkAnalyzerCore's causal_lag_matrix uses anti-symmetric
+        # signed-lag format; we extract directed edges via the
+        # high-level causal_network list and rebuild positive-only
+        # matrices that match the NNNU convention.
+        # ============================================================
+        lag_matrix = np.zeros((n, n), dtype=int)
         binary = np.zeros((n, n), dtype=int)
-        for link in net_r.causal_network:
-            binary[link.from_dim, link.to_dim] = 1
-        for link in net_r.sync_network:
-            binary[link.from_dim, link.to_dim] = 1
-            binary[link.to_dim, link.from_dim] = 1
+        net_score = np.zeros((n, n))
+        sign_matrix = np.zeros((n, n), dtype=int)
 
-        lag_matrix = net_r.causal_lag_matrix if net_r.causal_lag_matrix is not None else np.zeros((n, n), dtype=int)
+        # Directed causal links — positive lag, directional
+        for link in net_r.causal_network:
+            i, j = link.from_dim, link.to_dim
+            binary[i, j] = 1
+            lag_matrix[i, j] = int(link.lag)
+            net_score[i, j] = float(link.strength)
+            sign_matrix[i, j] = 1 if link.correlation >= 0 else -1
+
+        # Undirected sync links — fill both directions (no lag)
+        for link in net_r.sync_network:
+            i, j = link.from_dim, link.to_dim
+            binary[i, j] = 1
+            binary[j, i] = 1
+            # Don't overwrite if a directed causal link already set the score
+            if net_score[i, j] == 0:
+                net_score[i, j] = float(link.strength)
+                sign_matrix[i, j] = 1 if link.correlation >= 0 else -1
+            if net_score[j, i] == 0:
+                net_score[j, i] = float(link.strength)
+                sign_matrix[j, i] = 1 if link.correlation >= 0 else -1
+
+        # Apply Inverse DI gate (soft amplification of confirmed edges)
+        scores = self._apply_di_gate(net_score, ice_r.direct_score_matrix, n)
 
         return MethodOutput(
             method_name=self.method_name,
@@ -249,11 +293,14 @@ class FISJAdapter:
             adjacency_scores=scores,
             adjacency_bin=binary,
             lag_matrix=lag_matrix,
-            sign_matrix=np.sign(net_score).astype(int),
+            sign_matrix=sign_matrix,
             meta={
                 "di_matrix": ice_r.direct_score_matrix,
                 "sync_matrix": net_r.sync_matrix,
                 "causal_matrix": net_r.causal_matrix,
+                "adaptive_params": net_r.adaptive_params,
+                "n_sync_links": net_r.n_sync_links,
+                "n_causal_links": net_r.n_causal_links,
             },
         )
 
@@ -440,7 +487,7 @@ def run_fisj(data, max_lag=3, method="nnnu_inverse", **kwargs):
     Returns
     -------
     scores : ndarray (N, N)
-    lags : ndarray (N, N)
+    lags : ndarray (N, N) — positive values only (direction-aware)
     pvals : ndarray (N, N)
     """
     n_dims = data.shape[1]
