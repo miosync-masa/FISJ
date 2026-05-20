@@ -40,7 +40,7 @@ from .core import (
     benjamini_hochberg_per_source,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.9.9"
 
 __all__ = [
     # Main interface
