@@ -20,9 +20,13 @@ Methods:
 
 Engines (advanced use):
     >>> from FISJ.engines import NNNUEngine, InverseCausalEngine
+
+Benchmark utilities:
+    >>> from FISJ import make_topk_binary
+    >>> binary_topk = make_topk_binary(result.adjacency_scores, k=expected_edges)
 """
 
-from .adapter import FISJAdapter, MethodOutput, run_fisj
+from .adapter import FISJAdapter, MethodOutput, run_fisj, make_topk_binary
 
 # Engine direct access
 from .engines import (
@@ -47,6 +51,7 @@ __all__ = [
     "FISJAdapter",
     "MethodOutput",
     "run_fisj",
+    "make_topk_binary",
     # Engines
     "NNNUEngine",
     "NNNUResult",
