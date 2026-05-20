@@ -162,7 +162,22 @@ class FISJAdapter:
         )
 
     # ==================================================================
-    # Method: NNNU_Inverse (Layer 1 + Inverse + Regime rescue)
+    # Method: NNNU_Inverse (OR-combined hybrid)
+    # ==================================================================
+    # Combines two complementary causal-discovery philosophies:
+    #
+    #   NNNU (Layer 1):    Consistency-based — "do they move together?"
+    #                      Strong for high-SNR causal jumps.
+    #                      Weak for low-SNR continuous coupling.
+    #
+    #   Inverse (Layer 2): Uniqueness-based — "is this the only explanation?"
+    #                      Strong even for low-SNR coupling (Ridge solver
+    #                      estimates coefficients directly).
+    #                      Can be fooled by confounders (spurious DI).
+    #
+    # The OR-combined version takes the maximum of both signals and adds
+    # an agreement bonus when both engines agree. NNNU's textbook filter
+    # is used to suppress confounder-induced spurious DI values.
     # ==================================================================
 
     def _run_nnnu_inverse(self, df):
@@ -171,7 +186,7 @@ class FISJAdapter:
         data = df.values.astype(np.float64)
         n_frames = data.shape[0]
 
-        # Layer 1: NNNU
+        # Layer 1: NNNU (consistency-based)
         engine = NNNUEngine(
             max_lag=self.max_lag,
             delta_percentile=self.delta_percentile,
@@ -185,7 +200,7 @@ class FISJAdapter:
         if self.regime_aware and n_frames >= self.min_segment_length * 2:
             nnnu_r, regime_labels = self._regime_rescue(data, nnnu_r, n, n_frames)
 
-        # Layer 2: Inverse
+        # Layer 2: Inverse (uniqueness-based)
         ice_config = InverseCausalEngineConfig(
             max_lag=self.max_lag,
             ar_lag=1,
@@ -200,12 +215,45 @@ class FISJAdapter:
         )
         ice_r = InverseCausalEngine(ice_config).fit(data, dimension_names=names)
 
-        # Fusion: NNNU × DI gate × suppress
-        scores = self._apply_di_gate(nnnu_r.score_matrix, ice_r.direct_score_matrix, n)
-        scores = self._apply_suppress(scores, nnnu_r.q_matrix, nnnu_r.consistency_matrix, n)
+        di_matrix = (
+            ice_r.direct_score_matrix.copy()
+            if ice_r.direct_score_matrix is not None
+            else np.zeros((n, n))
+        )
 
-        # Binary: NNNU's own binary (already filtered)
-        binary = nnnu_r.binary_matrix.astype(int)
+        # ============================================================
+        # Step 1: Propagate NNNU's textbook filter to Inverse DI
+        # ============================================================
+        # NNNU's spurious filter identifies common-ancestor and
+        # mediator patterns. When NNNU has high confidence (q < alpha
+        # at raw level) and filtered the edge out, we discount the
+        # corresponding DI value because Inverse alone can be fooled
+        # by confounders.
+        di_filtered = self._propagate_nnnu_filter_to_inverse(
+            di_matrix, nnnu_r, n,
+        )
+
+        # ============================================================
+        # Step 2: Normalize both signals
+        # ============================================================
+        nnnu_norm = self._normalize_score(nnnu_r.score_matrix)
+        di_norm = self._normalize_score(di_filtered)
+
+        # ============================================================
+        # Step 3: OR-combine — max() + agreement bonus
+        # ============================================================
+        # Take whichever engine is more confident, and add a bonus
+        # when both engines agree (uniqueness AND consistency).
+        scores = self._or_combine(nnnu_norm, di_norm, bonus=0.3)
+        np.fill_diagonal(scores, 0.0)
+
+        # ============================================================
+        # Step 4: Binary — NNNU strict + Inverse rescue
+        # ============================================================
+        binary = nnnu_r.binary_matrix.astype(int).copy()
+        binary = self._inverse_rescue_binary(
+            binary, di_norm, nnnu_r, n,
+        )
 
         return MethodOutput(
             method_name=self.method_name,
@@ -217,11 +265,104 @@ class FISJAdapter:
             meta={
                 "q_matrix": nnnu_r.q_matrix,
                 "consistency_matrix": nnnu_r.consistency_matrix,
-                "di_matrix": ice_r.direct_score_matrix,
+                "di_matrix": di_matrix,
+                "di_filtered": di_filtered,
+                "nnnu_score_normalized": nnnu_norm,
+                "di_normalized": di_norm,
                 "total_jumps": nnnu_r.total_jumps,
                 "regime_labels": regime_labels,
             },
         )
+
+    # ==================================================================
+    # OR-combination primitives
+    # ==================================================================
+
+    def _propagate_nnnu_filter_to_inverse(
+        self, di_matrix: np.ndarray, nnnu_r, n: int,
+    ) -> np.ndarray:
+        """
+        Apply NNNU's spurious-edge filter to Inverse DI scores.
+
+        When NNNU has detected an edge at the raw level (raw_score > 0)
+        but then explicitly filtered it as spurious (final score = 0)
+        AND has high statistical confidence in that judgment
+        (q-value < alpha), the corresponding Inverse DI value is
+        discounted. This handles confounder-induced uniqueness signals
+        that Inverse alone cannot distinguish from true causality.
+        """
+        raw = nnnu_r.raw_score_matrix
+        final = nnnu_r.score_matrix
+        q_matrix = nnnu_r.q_matrix
+
+        out = di_matrix.copy()
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                # NNNU's textbook filter said "spurious" with confidence
+                is_filtered = raw[i, j] > 0 and final[i, j] == 0
+                if is_filtered and q_matrix[i, j] < self.alpha:
+                    out[i, j] *= self.suppress_floor
+        return out
+
+    @staticmethod
+    def _normalize_score(score_matrix: np.ndarray) -> np.ndarray:
+        """Normalize a score matrix to [0, 1] by its max."""
+        out = np.maximum(score_matrix, 0.0)
+        peak = out.max()
+        if peak > 1e-10:
+            out = out / peak
+        return out
+
+    @staticmethod
+    def _or_combine(a: np.ndarray, b: np.ndarray, bonus: float = 0.3) -> np.ndarray:
+        """
+        OR-combine two normalized score matrices.
+
+        scores = max(a, b) + bonus * (a * b)
+
+        - max() takes the more confident engine's verdict per edge
+        - agreement bonus rewards edges where both engines agree
+        """
+        combined = np.maximum(a, b)
+        agreement = a * b
+        return combined + bonus * agreement
+
+    def _inverse_rescue_binary(
+        self, binary: np.ndarray, di_norm: np.ndarray, nnnu_r, n: int,
+        di_threshold: float = 0.5,
+    ) -> np.ndarray:
+        """
+        Add edges to binary where Inverse is highly confident AND
+        NNNU didn't explicitly filter them as spurious.
+
+        Inverse DI normalized >= di_threshold and NNNU's raw signal > 0
+        but not flagged as spurious → add to binary.
+        """
+        raw = nnnu_r.raw_score_matrix
+        final = nnnu_r.score_matrix
+        q_matrix = nnnu_r.q_matrix
+
+        out = binary.copy()
+        for i in range(n):
+            for j in range(n):
+                if i == j or out[i, j] == 1:
+                    continue
+                if di_norm[i, j] < di_threshold:
+                    continue
+                # NNNU has at least a hint of signal
+                if raw[i, j] <= 0:
+                    continue
+                # NNNU has NOT confidently filtered as spurious
+                is_confident_spurious = (
+                    raw[i, j] > 0 and final[i, j] == 0
+                    and q_matrix[i, j] < self.alpha
+                )
+                if not is_confident_spurious:
+                    out[i, j] = 1
+        return out
+
 
     # ==================================================================
     # Method: Fusion (NetworkCore + Inverse) — legacy
@@ -498,3 +639,75 @@ def run_fisj(data, max_lag=3, method="nnnu_inverse", **kwargs):
     lags = result.lag_matrix if result.lag_matrix is not None else np.zeros((n_dims, n_dims), dtype=int)
     pvals = result.meta.get("q_matrix", np.ones((n_dims, n_dims)))
     return scores, lags, pvals
+
+
+# ==================================================================
+# Top-K binary utility
+# ==================================================================
+
+def make_topk_binary(scores: np.ndarray, k: int) -> np.ndarray:
+    """
+    Convert score matrix to binary by selecting the top-K edges.
+
+    FISJ's default ``adjacency_bin`` is conservative — it returns
+    only edges that pass statistical significance, spurious-edge
+    filtering, and directional consistency. This is good for
+    production use ("when FISJ says yes, it means yes") but
+    pessimistic for benchmarks where weak-signal datasets push
+    the strict binary toward zero detections even when the score
+    ranking is meaningful.
+
+    Top-K binary uses the score ranking directly: the K highest
+    off-diagonal scores become edges, regardless of the strict
+    threshold. This matches the evaluation protocol of CauseMe,
+    TimeGraph, and most published causal-discovery benchmarks,
+    where the true edge count is part of the experiment metadata.
+
+    Parameters
+    ----------
+    scores : np.ndarray, shape (n, n)
+        Score matrix from a ``FISJAdapter.fit()`` call's
+        ``adjacency_scores`` field.
+    k : int
+        Number of edges to retain (typically the true edge count
+        of the ground-truth graph, provided by the benchmark).
+
+    Returns
+    -------
+    np.ndarray, shape (n, n), dtype=int
+        Binary adjacency matrix with at most ``k`` ones placed at
+        the positions of the largest off-diagonal scores. The
+        diagonal is always zero.
+
+    Examples
+    --------
+    >>> result = adapter.fit(df)
+    >>> binary_topk = make_topk_binary(result.adjacency_scores, k=true_edge_count)
+    >>> # Use binary_topk in benchmark evaluation
+    """
+    if scores is None or scores.size == 0:
+        return np.zeros((0, 0), dtype=int)
+
+    n = scores.shape[0]
+    binary = np.zeros((n, n), dtype=int)
+
+    if k <= 0:
+        return binary
+
+    # Collect off-diagonal positive scores
+    flat = []
+    for i in range(n):
+        for j in range(n):
+            if i != j and scores[i, j] > 0:
+                flat.append((float(scores[i, j]), i, j))
+
+    if not flat:
+        return binary
+
+    flat.sort(reverse=True)
+
+    # Take top-K (or fewer if not enough positive scores)
+    for _, i, j in flat[:k]:
+        binary[i, j] = 1
+
+    return binary
